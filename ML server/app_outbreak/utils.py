@@ -77,7 +77,7 @@ class OutbreakJobOrchestrator:
             raise ValueError("Missing required training dataset URIs for model2")
 
         self.minio_service.download_file(sales_uri, runtime_data_dir / "sales.csv")
-        self.minio_service.download_file(facilities_uri, runtime_data_dir / "healthcares.csv")
+        self.minio_service.download_file(facilities_uri, runtime_data_dir / "facilities.csv")
 
         if medicines_uri:
             self.minio_service.download_file(medicines_uri, runtime_data_dir / "medicines.csv")

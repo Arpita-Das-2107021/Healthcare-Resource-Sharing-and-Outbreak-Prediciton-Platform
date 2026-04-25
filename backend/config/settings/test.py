@@ -40,3 +40,6 @@ REST_FRAMEWORK = {
 
 # Keep test email assertions local and side-effect free.
 EMAIL_BACKEND = "django.core.mail.backends.locmem.EmailBackend"
+
+# Keep catalog API tests deterministic by default; dedicated tests can override this setting.
+MEDICINE_INFO_ENABLE_CATALOG_ENRICHMENT = False

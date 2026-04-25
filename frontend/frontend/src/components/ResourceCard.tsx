@@ -77,6 +77,7 @@ export const ResourceCard = ({
   };
 
   const styles = getAvailabilityStyles(resource.availability);
+  const displayType = String(resource.resourceTypeName || resource.type || '').trim() || 'Resource';
 
   const handleCardClick = (e: React.MouseEvent) => {
     // Don't trigger card click if clicking on buttons or hospital name
@@ -144,7 +145,7 @@ export const ResourceCard = ({
         <div className="absolute top-3 left-3 flex items-center gap-2">
           <span className="text-xl">{getTypeIcon(resource.type)}</span>
           <Badge variant="secondary" className="capitalize backdrop-blur-sm bg-background/80">
-            {resource.type}
+            {displayType}
           </Badge>
         </div>
 

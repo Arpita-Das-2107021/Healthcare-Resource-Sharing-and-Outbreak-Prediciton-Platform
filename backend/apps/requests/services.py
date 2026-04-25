@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import uuid
+from dataclasses import dataclass
 from functools import wraps
 from decimal import Decimal
 from datetime import timedelta
@@ -38,10 +39,15 @@ from .models import (
     DeliveryEvent,
     DeliveryToken,
     DispatchEvent,
+    PartialReturnRecord,
     PaymentGatewayWebhookEvent,
     PaymentLedgerEntry,
     PaymentReconciliationRun,
     PaymentTransaction,
+    RefundCause,
+    RefundPolicyRule,
+    RefundRequest,
+    RefundStatus,
     RequestOperationIdempotency,
     ResourceRequest,
     ResourceRequestApproval,
@@ -2228,6 +2234,24 @@ def cancel_request(req: ResourceRequest, actor, reason: str = "") -> ResourceReq
         _write_transition(req, from_state, req.workflow_state, actor, reason=req.cancellation_reason)
         _write_workflow_audit(req, "request_cancelled", "success", actor, details={"reason": req.cancellation_reason})
 
+        # If a successful payment exists, a refund must be initiated separately
+        # (NOT inline — see design §3.5). Log the intent so an async task can pick it up.
+        payment_was_successful = PaymentTransaction.objects.filter(
+            request=req,
+            payment_status=PaymentTransaction.PaymentStatus.SUCCESS,
+        ).exists()
+        if payment_was_successful:
+            _write_workflow_audit(
+                req,
+                "cancel_triggered_refund_enqueue",
+                "success",
+                actor,
+                details={
+                    "note": "Refund must be initiated via POST /refunds/initiate/ with cause=REQUESTER_CANCELLATION.",
+                    "reason": req.cancellation_reason,
+                },
+            )
+
         _publish_badge_event_after_commit(
             RequestCancelledEvent(
                 event_id=f"request-cancelled:{req.id}",
@@ -2270,7 +2294,15 @@ def initiate_return(req: ResourceRequest, actor, reason: str = "") -> dict:
     }
 
 
-def verify_return(req: ResourceRequest, return_token: str, actor) -> ResourceRequest:
+def verify_return(
+    req: ResourceRequest,
+    return_token: str,
+    actor,
+    quantity_returned: int | None = None,
+    quantity_damaged: int = 0,
+    quantity_lost: int = 0,
+    verification_notes: str = "",
+) -> ResourceRequest:
     from apps.shipments.models import Shipment, ShipmentTracking
 
     _ensure_supplier_hospital_actor(req, actor, "verify return")
@@ -2287,6 +2319,14 @@ def verify_return(req: ResourceRequest, return_token: str, actor) -> ResourceReq
         raise ValidationError({"detail": "Invalid return token."})
     if shipment.return_token_used_at:
         raise ValidationError({"detail": "Return token already used."})
+
+    # Default returned quantity to the full transferred quantity if not supplied.
+    effective_returned = quantity_returned if quantity_returned is not None else (req.quantity_transferred or 0)
+    max_qty = req.quantity_transferred or 0
+    if (effective_returned + quantity_damaged + quantity_lost) > max_qty and max_qty > 0:
+        raise ValidationError(
+            {"detail": "Sum of returned + damaged + lost quantities exceeds quantity_transferred."}
+        )
 
     with transaction.atomic():
         released_qty = req.quantity_reserved or req.quantity_approved or req.quantity_requested
@@ -2323,6 +2363,67 @@ def verify_return(req: ResourceRequest, return_token: str, actor) -> ResourceReq
         req_update_fields = ["quantity_reserved", "updated_at"]
         req_update_fields.extend(_stop_request_sla_timer(req))
         req.save(update_fields=req_update_fields)
+
+        # Create or update PartialReturnRecord for this verification event.
+        return_record, _ = PartialReturnRecord.objects.update_or_create(
+            request=req,
+            defaults={
+                "shipment": shipment,
+                "quantity_returned": effective_returned,
+                "quantity_damaged": quantity_damaged,
+                "quantity_lost": quantity_lost,
+                "return_verified": True,
+                "verified_by": actor,
+                "verified_at": timezone.now(),
+                "verification_notes": verification_notes,
+                "return_token_used": return_token,
+            },
+        )
+
+        # If a RefundRequest is blocked on return verification, advance it to PENDING.
+        blocked_refund = (
+            RefundRequest.objects.select_for_update()
+            .filter(request=req, refund_status=RefundStatus.PENDING_RETURN_VERIFICATION)
+            .first()
+        )
+        if blocked_refund:
+            # Recalculate refund amount based on actual returned quantities.
+            outcome = evaluate_refund_policy(
+                req,
+                blocked_refund.cause,
+                returned_quantity=effective_returned,
+                damaged_quantity=quantity_damaged,
+            )
+            blocked_refund.refund_amount = outcome.refund_amount
+            blocked_refund.refund_percentage_applied = outcome.refund_percentage_applied
+            blocked_refund.refund_status = RefundStatus.PENDING
+            blocked_refund.sla_deadline_at = timezone.now() + timedelta(hours=_REFUND_PENDING_SLA_HOURS)
+            blocked_refund.save(update_fields=[
+                "refund_amount", "refund_percentage_applied",
+                "refund_status", "sla_deadline_at", "updated_at",
+            ])
+            return_record.refund_request = blocked_refund
+            return_record.save(update_fields=["refund_request", "updated_at"])
+            _write_workflow_audit(
+                req,
+                "return_verified",
+                "success",
+                actor,
+                details={
+                    "refund_request_id": str(blocked_refund.id),
+                    "refund_amount": str(outcome.refund_amount),
+                    "refund_status": RefundStatus.PENDING,
+                    "quantity_returned": effective_returned,
+                },
+            )
+        else:
+            _write_workflow_audit(
+                req,
+                "return_verified",
+                "success",
+                actor,
+                details={"quantity_returned": effective_returned, "quantity_damaged": quantity_damaged},
+            )
 
         _notify_inventory_update_after_commit(
             req=req,
@@ -2868,76 +2969,338 @@ def confirm_payment_transaction(
     }
 
 
-@_require_mutable_request_workflow
-def initiate_refund(req: ResourceRequest, actor, reason: str = "") -> dict:
-    _ensure_requesting_hospital_actor(req, actor, "initiate refund")
+# ---------------------------------------------------------------------------
+# Refund policy engine
+# ---------------------------------------------------------------------------
 
-    payment = PaymentTransaction.objects.filter(
+_REFUND_INITIATABLE_STATES = frozenset({
+    ResourceRequest.WorkflowState.PAYMENT_COMPLETED,
+    ResourceRequest.WorkflowState.IN_TRANSIT,
+    ResourceRequest.WorkflowState.COMPLETED,
+    ResourceRequest.WorkflowState.CANCELLED,
+    ResourceRequest.WorkflowState.FAILED,
+})
+
+# Causes that always result in 0% refund; blocked before engine runs.
+_FRAUD_BLOCK_CAUSES = frozenset({
+    RefundCause.FRAUD_SUSPECTED,
+    RefundCause.POLICY_VIOLATION,
+})
+
+# Default SLA for a refund sitting in PENDING state (hours).
+_REFUND_PENDING_SLA_HOURS = 24
+
+
+@dataclass
+class RefundOutcome:
+    refund_amount: Decimal
+    refund_percentage_applied: Decimal
+    cause_used: str
+    policy_rule: object  # RefundPolicyRule | None
+    requires_return_verification: bool
+    gateway_supported: bool
+    rationale: str
+
+
+def evaluate_refund_policy(
+    req: ResourceRequest,
+    cause: str,
+    returned_quantity: int | None = None,
+    damaged_quantity: int | None = None,
+) -> RefundOutcome:
+    """
+    Stateless engine: looks up RefundPolicyRule and computes the refund outcome.
+    Does NOT write to the database. Must be called inside the caller's transaction.
+    """
+    # Exact match first, then stage-default (NULL cause), then system fallback.
+    rule = (
+        RefundPolicyRule.objects.filter(
+            workflow_state=req.workflow_state,
+            cause=cause,
+            is_active=True,
+        ).first()
+        or RefundPolicyRule.objects.filter(
+            workflow_state=req.workflow_state,
+            cause__isnull=True,
+            is_active=True,
+        ).first()
+    )
+
+    if rule is None:
+        return RefundOutcome(
+            refund_amount=Decimal("0.00"),
+            refund_percentage_applied=Decimal("0.00"),
+            cause_used=cause,
+            policy_rule=None,
+            requires_return_verification=False,
+            gateway_supported=False,
+            rationale="No matching policy rule; system fallback: 0% refund, manual review required.",
+        )
+
+    base_amount = req.total_price * (rule.refund_percentage / Decimal("100"))
+
+    # Partial-return adjustment.
+    quantity_transferred = req.quantity_transferred or 0
+    if returned_quantity is not None and quantity_transferred > 0:
+        usable = returned_quantity
+        if cause == RefundCause.SUPPLIER_QUALITY_FAILURE and damaged_quantity:
+            usable += damaged_quantity
+        ratio = Decimal(str(usable)) / Decimal(str(quantity_transferred))
+        final_amount = (base_amount * ratio).quantize(Decimal("0.01"))
+        rationale = (
+            f"Rule ({req.workflow_state}, {cause}): {rule.refund_percentage}% base; "
+            f"partial ratio {usable}/{quantity_transferred} applied."
+        )
+    else:
+        final_amount = base_amount.quantize(Decimal("0.01"))
+        rationale = f"Rule ({req.workflow_state}, {cause}): {rule.refund_percentage}% applied."
+
+    return RefundOutcome(
+        refund_amount=final_amount,
+        refund_percentage_applied=rule.refund_percentage,
+        cause_used=cause,
+        policy_rule=rule,
+        requires_return_verification=rule.requires_return_verification,
+        gateway_supported=rule.gateway_supported,
+        rationale=rationale,
+    )
+
+
+def _ensure_refund_initiatable(req: ResourceRequest, cause: str) -> None:
+    """Guard for initiate_refund(): replaces @_require_mutable_request_workflow."""
+    if cause in _FRAUD_BLOCK_CAUSES:
+        raise ValidationError(
+            {"detail": f"Refund prohibited: cause '{cause}' is a fraud/policy block. No refund is payable."}
+        )
+    if req.workflow_state not in _REFUND_INITIATABLE_STATES:
+        raise ValidationError(
+            {"detail": f"Refund cannot be initiated from workflow state '{req.workflow_state}'."}
+        )
+
+
+def _ensure_refund_confirmable(req: ResourceRequest) -> None:
+    """Guard for confirm_refund(): checks RefundRequest state, not workflow state."""
+    active = RefundRequest.objects.filter(
         request=req,
-        payment_status=PaymentTransaction.PaymentStatus.SUCCESS,
-    ).order_by("-created_at").first()
-    if not payment:
-        raise ValidationError({"detail": "No successful payment found to refund."})
+        refund_status__in=[RefundStatus.PENDING, RefundStatus.PROCESSING],
+    ).exists()
+    if not active:
+        raise ValidationError(
+            {"detail": "No refund in PENDING or PROCESSING state found for this request."}
+        )
+
+
+# ---------------------------------------------------------------------------
+# Refund initiation
+# ---------------------------------------------------------------------------
+
+def initiate_refund(
+    req: ResourceRequest,
+    actor,
+    cause: str,
+    cause_note: str = "",
+    idempotency_key: str = "",
+    returned_quantity: int | None = None,
+    damaged_quantity: int | None = None,
+) -> dict:
+    _ensure_requesting_hospital_actor(req, actor, "initiate refund")
+    _ensure_refund_initiatable(req, cause)
+
+    if not idempotency_key:
+        idempotency_key = str(uuid.uuid4())
 
     with transaction.atomic():
+        # Lock payment row to prevent concurrent duplicate refunds.
+        payment = (
+            PaymentTransaction.objects.select_for_update()
+            .filter(request=req, payment_status=PaymentTransaction.PaymentStatus.SUCCESS)
+            .order_by("-created_at")
+            .first()
+        )
+        if not payment:
+            raise ValidationError({"detail": "No successful payment found to refund."})
+
+        # Idempotency: return cached response if same key was already processed.
+        existing_idem = RequestOperationIdempotency.objects.filter(
+            operation_type=RequestOperationIdempotency.OperationType.REFUND_INITIATE,
+            idempotency_key=idempotency_key,
+        ).first()
+        if existing_idem:
+            return existing_idem.response_snapshot
+
+        # Check for an already-active RefundRequest for this payment.
+        existing_refund = (
+            RefundRequest.objects.select_for_update()
+            .filter(payment_transaction=payment)
+            .exclude(refund_status__in=[RefundStatus.REFUND_FAILED, RefundStatus.CANCELLED])
+            .first()
+        )
+        if existing_refund:
+            raise ValidationError(
+                {"detail": "A refund is already in progress for this payment. Use a new request only after the current one reaches REFUND_FAILED or CANCELLED."}
+            )
+
+        # Evaluate policy (stateless; safe inside transaction).
+        outcome = evaluate_refund_policy(req, cause, returned_quantity, damaged_quantity)
+
+        initial_status = (
+            RefundStatus.PENDING_RETURN_VERIFICATION
+            if outcome.requires_return_verification
+            else RefundStatus.PENDING
+        )
+
+        sla_deadline = timezone.now() + timedelta(hours=_REFUND_PENDING_SLA_HOURS)
+
+        refund_req = RefundRequest.objects.create(
+            payment_transaction=payment,
+            request=req,
+            cause=cause,
+            cause_note=cause_note,
+            policy_rule=outcome.policy_rule,
+            refund_percentage_applied=outcome.refund_percentage_applied,
+            refund_amount=outcome.refund_amount,
+            currency=payment.currency,
+            refund_status=initial_status,
+            idempotency_key=idempotency_key,
+            initiated_by=actor,
+            sla_deadline_at=sla_deadline if initial_status == RefundStatus.PENDING else None,
+            initiated_at=timezone.now(),
+        )
+
         payment.payment_status = PaymentTransaction.PaymentStatus.REFUND_PENDING
-        payment.failure_message = reason or payment.failure_message
-        payment.save(update_fields=["payment_status", "failure_message", "updated_at"])
+        payment.save(update_fields=["payment_status", "updated_at"])
+
         req.payment_status = ResourceRequest.PaymentStatus.REFUND_PENDING
         req.save(update_fields=["payment_status", "updated_at"])
-        _write_workflow_audit(req, "refund_initiated", "success", actor, details={"payment_id": str(payment.id)})
 
-    return {
-        "request_id": str(req.id),
-        "payment_status": payment.payment_status,
-    }
+        audit_details = {
+            "refund_request_id": str(refund_req.id),
+            "payment_id": str(payment.id),
+            "cause": cause,
+            "refund_amount": str(outcome.refund_amount),
+            "refund_percentage": str(outcome.refund_percentage_applied),
+            "requires_return_verification": outcome.requires_return_verification,
+            "rationale": outcome.rationale,
+        }
+        _write_workflow_audit(req, "refund_initiated", "success", actor, details=audit_details)
+        _write_workflow_audit(req, "refund_cause_recorded", "success", actor, details={"cause": cause, "cause_note": cause_note})
+        _write_workflow_audit(req, "refund_policy_evaluated", "success", actor, details={"rationale": outcome.rationale})
+
+        response = {
+            "request_id": str(req.id),
+            "refund_request_id": str(refund_req.id),
+            "refund_status": refund_req.refund_status,
+            "refund_amount": str(refund_req.refund_amount),
+            "refund_percentage_applied": str(refund_req.refund_percentage_applied),
+            "requires_return_verification": outcome.requires_return_verification,
+            "payment_status": payment.payment_status,
+        }
+
+        RequestOperationIdempotency.objects.create(
+            request=req,
+            operation_type=RequestOperationIdempotency.OperationType.REFUND_INITIATE,
+            idempotency_key=idempotency_key,
+            request_hash="",
+            response_snapshot=response,
+            expires_at=timezone.now() + timedelta(days=2),
+        )
+
+    return response
 
 
-@_require_mutable_request_workflow
-def confirm_refund(req: ResourceRequest, actor, payment_status: str, provider_transaction_id: str = "") -> dict:
+# ---------------------------------------------------------------------------
+# Refund confirmation (manual / admin-triggered)
+# ---------------------------------------------------------------------------
+
+def confirm_refund(
+    req: ResourceRequest,
+    actor,
+    payment_status: str,
+    provider_transaction_id: str = "",
+) -> dict:
     _ensure_requesting_hospital_actor(req, actor, "confirm refund")
+    _ensure_refund_confirmable(req)
 
     if payment_status not in (
         PaymentTransaction.PaymentStatus.REFUNDED,
         PaymentTransaction.PaymentStatus.REFUND_FAILED,
     ):
-        raise ValidationError({"detail": "Invalid refund status."})
-
-    payment = PaymentTransaction.objects.filter(
-        request=req,
-        payment_status=PaymentTransaction.PaymentStatus.REFUND_PENDING,
-    ).order_by("-created_at").first()
-    if not payment:
-        raise ValidationError({"detail": "No pending refund found for this request."})
+        raise ValidationError({"detail": "Invalid refund confirmation status."})
 
     with transaction.atomic():
-        payment.payment_status = payment_status
-        payment.provider_transaction_id = provider_transaction_id or payment.provider_transaction_id
+        payment = (
+            PaymentTransaction.objects.select_for_update()
+            .filter(request=req, payment_status=PaymentTransaction.PaymentStatus.REFUND_PENDING)
+            .order_by("-created_at")
+            .first()
+        )
+        if not payment:
+            raise ValidationError({"detail": "No payment in REFUND_PENDING state found for this request."})
+
+        refund_req = (
+            RefundRequest.objects.select_for_update()
+            .filter(
+                payment_transaction=payment,
+                refund_status__in=[RefundStatus.PENDING, RefundStatus.PROCESSING],
+            )
+            .first()
+        )
+        if not refund_req:
+            raise ValidationError({"detail": "No active RefundRequest found for this payment."})
+
+        new_refund_status = (
+            RefundStatus.REFUNDED
+            if payment_status == PaymentTransaction.PaymentStatus.REFUNDED
+            else RefundStatus.REFUND_FAILED
+        )
+
         if payment_status == PaymentTransaction.PaymentStatus.REFUNDED:
+            # Use engine-computed amount, not the full original payment amount.
+            refund_amount = refund_req.refund_amount
             PaymentLedgerEntry.objects.create(
                 payment_transaction=payment,
                 hospital=req.requesting_hospital,
                 entry_type=PaymentLedgerEntry.EntryType.REFUND_RECEIVED,
-                amount=payment.amount,
-                currency=payment.currency,
+                amount=refund_amount,
+                currency=refund_req.currency,
             )
             PaymentLedgerEntry.objects.create(
                 payment_transaction=payment,
                 hospital=req.supplying_hospital,
                 entry_type=PaymentLedgerEntry.EntryType.REFUND_SENT,
-                amount=payment.amount,
-                currency=payment.currency,
+                amount=refund_amount,
+                currency=refund_req.currency,
             )
             req.payment_status = ResourceRequest.PaymentStatus.REFUNDED
+            refund_req.completed_at = timezone.now()
         else:
             req.payment_status = ResourceRequest.PaymentStatus.REFUND_FAILED
+            refund_req.failed_at = timezone.now()
+            refund_req.retry_count += 1
+
+        payment.payment_status = payment_status
+        if provider_transaction_id:
+            payment.provider_transaction_id = provider_transaction_id
         payment.save(update_fields=["payment_status", "provider_transaction_id", "updated_at"])
+
+        refund_req.refund_status = new_refund_status
+        refund_req.save(update_fields=["refund_status", "completed_at", "failed_at", "retry_count", "updated_at"])
+
         req.save(update_fields=["payment_status", "updated_at"])
-        _write_workflow_audit(req, "refund_confirmed", "success", actor, details={"payment_status": payment_status})
+        _write_workflow_audit(
+            req,
+            "refund_completed" if new_refund_status == RefundStatus.REFUNDED else "refund_gateway_failed",
+            "success",
+            actor,
+            details={"refund_request_id": str(refund_req.id), "payment_status": payment_status},
+        )
 
     return {
         "request_id": str(req.id),
+        "refund_request_id": str(refund_req.id),
+        "refund_status": refund_req.refund_status,
         "payment_status": payment.payment_status,
+        "refund_amount": str(refund_req.refund_amount),
     }
 
 
@@ -3320,11 +3683,18 @@ def get_payment_report_summary(hospital_id=None, date_from=None, date_to=None, a
         ):
             received_total += row.amount
 
+    net_balance = float(received_total - sent_total)
+
     return {
+        "report_id": f"rep_{uuid.uuid4().hex[:12]}",
         "hospital_id": str(scoped_hospital_id) if scoped_hospital_id else None,
-        "total_sent": str(sent_total),
-        "total_received": str(received_total),
         "currency": "BDT",
+        "summary": {
+            "total_sent": float(sent_total),
+            "total_received": float(received_total),
+            "net_balance": net_balance,
+        },
+        "transactions": [],
     }
 
 

@@ -46,6 +46,7 @@ export interface SharedResource {
 }
 
 export interface ResourceWithVisibility extends SharedResource {
+  resourceTypeName?: string;
   isVisibleToOthers: boolean;
   requestCount?: number;
   image?: string;

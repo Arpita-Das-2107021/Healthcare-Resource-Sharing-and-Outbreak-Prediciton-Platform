@@ -14,8 +14,6 @@ To design and build a web-based coordination and intelligence platform that impr
 
 The platform works alongside existing Healthcare Management Systems — not as a replacement — and focuses on visibility, communication, and decision support.It also supports small pharmacies by providing them an inventory management interface.
 
-Documentation index: `docs/README.md`
-
 ---
 
 ## RBAC Authorization Layer
@@ -57,7 +55,7 @@ Dual-scope API base path:
 
 Detailed design and extension guide:
 
-- `docs/security/rbac_authorization.md`
+- `integration_docs/rbac_authorization.md`
 
 ---
 
@@ -670,7 +668,7 @@ Cache-aside behavior:
 
 ML dataset generation/upload workflow details and real-container validation steps:
 
-- `docs/integration/ml_dataset_pipeline_audit_and_validation.md`
+- `integration_docs/ml_dataset_pipeline_audit_and_validation.md`
 
 ---
 

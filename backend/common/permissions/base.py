@@ -538,6 +538,85 @@ class CanViewMLSuggestions(RoleOrPermissionPermission):
     )
 
 
+# ---------------------------------------------------------------------------
+# Client-facing ML permissions — open to all authenticated hospital staff.
+# These govern the "frontend-safe" facility insight endpoints that return
+# already-computed results with no raw ML internals exposed.
+# ---------------------------------------------------------------------------
+
+class CanViewFacilityForecast(RoleOrPermissionPermission):
+    """Hospital staff reading their own facility's latest ML demand forecast."""
+    required_roles = (
+        ROLE_HEALTHCARE_ADMIN,
+        ROLE_PHARMACIST,
+        ROLE_INVENTORY_MANAGER,
+        ROLE_DOCTOR,
+        ROLE_LOGISTICS_STAFF,
+        ROLE_HOSPITAL_STAFF,
+        ROLE_ML_ENGINEER,
+        ROLE_ML_ADMIN,
+    )
+    required_permissions = (
+        PERMISSION_HOSPITAL_ANALYTICS_VIEW,
+        PERMISSION_HOSPITAL_INVENTORY_VIEW,
+        "ml:forecast.view",
+    )
+
+
+class CanViewFacilityOutbreak(RoleOrPermissionPermission):
+    """Hospital staff reading their own facility's latest ML outbreak alert."""
+    required_roles = (
+        ROLE_HEALTHCARE_ADMIN,
+        ROLE_PHARMACIST,
+        ROLE_INVENTORY_MANAGER,
+        ROLE_DOCTOR,
+        ROLE_LOGISTICS_STAFF,
+        ROLE_HOSPITAL_STAFF,
+        ROLE_ML_ENGINEER,
+        ROLE_ML_ADMIN,
+    )
+    required_permissions = (
+        PERMISSION_HOSPITAL_ANALYTICS_VIEW,
+        PERMISSION_HOSPITAL_INVENTORY_VIEW,
+        "ml:outbreak.view",
+    )
+
+
+class CanViewFacilitySuggestions(RoleOrPermissionPermission):
+    """Hospital staff reading ML-derived resource request suggestions for their facility."""
+    required_roles = (
+        ROLE_HEALTHCARE_ADMIN,
+        ROLE_PHARMACIST,
+        ROLE_INVENTORY_MANAGER,
+        ROLE_LOGISTICS_STAFF,
+        ROLE_HOSPITAL_STAFF,
+        ROLE_ML_ENGINEER,
+        ROLE_ML_ADMIN,
+    )
+    required_permissions = (
+        PERMISSION_HOSPITAL_ANALYTICS_VIEW,
+        PERMISSION_HOSPITAL_REQUEST_VIEW,
+        PERMISSION_HOSPITAL_INVENTORY_VIEW,
+        "ml:suggestion.view",
+    )
+
+
+class CanTriggerFacilityRefresh(RoleOrPermissionPermission):
+    """Permission to queue an on-demand ML inference refresh for a facility.
+
+    Intentionally permission-based with no role fallback, in line with the
+    project's scope-first RBAC policy.  Users must hold at least one of the
+    listed permission codes (e.g. granted via their hospital role assignment).
+    SUPER_ADMIN is still included via include_super_admin=True.
+    """
+    required_roles = ()
+    required_permissions = (
+        PERMISSION_HOSPITAL_ANALYTICS_VIEW,
+        PERMISSION_HOSPITAL_INVENTORY_MANAGE,
+        "ml:job.manage",
+    )
+
+
 class CanViewHospitalAnalytics(RoleOrPermissionPermission):
     required_roles = (
         ROLE_HEALTHCARE_ADMIN,

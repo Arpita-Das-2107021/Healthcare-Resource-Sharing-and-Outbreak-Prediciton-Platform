@@ -4,6 +4,13 @@ import numpy as np
 import pandas as pd
 
 
+def _column_or_default(frame: pd.DataFrame, column: str, default: object) -> pd.Series:
+    """Return an existing column as Series, or a same-length default Series."""
+    if column in frame.columns:
+        return frame[column]
+    return pd.Series(default, index=frame.index)
+
+
 def resolve_input_files(base_dir: Path) -> dict:
     """Resolve expected input CSV paths, supporting alternate file names."""
     candidates = {
@@ -37,6 +44,10 @@ def load_csvs(file_map: dict) -> dict:
 def preprocess_sales(sales_df: pd.DataFrame) -> pd.DataFrame:
     """Preprocess sales data: datetime conversion, sorting, and missing value handling."""
     df = sales_df.copy()
+
+    # Accept either healthcare_id or facility_id in incoming snapshots.
+    if "healthcare_id" not in df.columns and "facility_id" in df.columns:
+        df = df.rename(columns={"facility_id": "healthcare_id"})
 
     # Convert date column to pandas datetime.
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
@@ -208,9 +219,12 @@ def build_daily_entity_medicine_timeseries(sales_df: pd.DataFrame) -> pd.DataFra
         )
 
     base = sales_df.copy()
-    base["healthcare_id"] = base.get("healthcare_id", "UNKNOWN").fillna("UNKNOWN").astype(str)
+    if "healthcare_id" not in base.columns and "facility_id" in base.columns:
+        base = base.rename(columns={"facility_id": "healthcare_id"})
+
+    base["healthcare_id"] = _column_or_default(base, "healthcare_id", "UNKNOWN").fillna("UNKNOWN").astype(str)
     base["medicine_name"] = base["medicine_name"].fillna("UNKNOWN").astype(str)
-    base["upazila"] = base.get("upazila", "UNKNOWN").fillna("UNKNOWN").astype(str)
+    base["upazila"] = _column_or_default(base, "upazila", "UNKNOWN").fillna("UNKNOWN").astype(str)
 
     daily = (
         base.groupby(["date", "healthcare_id", "medicine_name"], as_index=False)["quantity_sold"]
@@ -322,6 +336,9 @@ def prepare_hrsp_global_shareable_data(
     medicine_df = datasets["medicine_info"].copy()
     disease_df = datasets["disease"].copy()
 
+    if "healthcare_id" not in healthcare_df.columns and "facility_id" in healthcare_df.columns:
+        healthcare_df = healthcare_df.rename(columns={"facility_id": "healthcare_id"})
+
     panel = build_daily_entity_medicine_timeseries(sales_clean)
     if panel.empty:
         empty_cols = ["date", "healthcare_id", "medicine_name", "target_shareable_amount"]
@@ -362,13 +379,13 @@ def prepare_hrsp_global_shareable_data(
         panel["upazila"] = panel["upazila"].fillna(panel["upazila_healthcare"])
     panel["upazila"] = panel["upazila"].fillna("UNKNOWN").astype(str)
 
-    panel["lat"] = pd.to_numeric(panel.get("lat", 0.0), errors="coerce").fillna(0.0)
-    panel["lon"] = pd.to_numeric(panel.get("lon", 0.0), errors="coerce").fillna(0.0)
-    panel["base_daily_sales"] = pd.to_numeric(panel.get("base_daily_sales", 0.0), errors="coerce").fillna(0.0)
+    panel["lat"] = pd.to_numeric(_column_or_default(panel, "lat", 0.0), errors="coerce").fillna(0.0)
+    panel["lon"] = pd.to_numeric(_column_or_default(panel, "lon", 0.0), errors="coerce").fillna(0.0)
+    panel["base_daily_sales"] = pd.to_numeric(_column_or_default(panel, "base_daily_sales", 0.0), errors="coerce").fillna(0.0)
     panel["outbreak_multiplier"] = (
-        pd.to_numeric(panel.get("outbreak_multiplier", 1.0), errors="coerce").fillna(1.0)
+        pd.to_numeric(_column_or_default(panel, "outbreak_multiplier", 1.0), errors="coerce").fillna(1.0)
     )
-    panel["signals_disease"] = panel.get("signals_disease", "Unknown").fillna("Unknown").astype(str)
+    panel["signals_disease"] = _column_or_default(panel, "signals_disease", "Unknown").fillna("Unknown").astype(str)
 
     panel = panel.sort_values(["healthcare_id", "medicine_name", "date"]).reset_index(drop=True)
     panel["day_index"] = (panel["date"] - panel["date"].min()).dt.days + 1

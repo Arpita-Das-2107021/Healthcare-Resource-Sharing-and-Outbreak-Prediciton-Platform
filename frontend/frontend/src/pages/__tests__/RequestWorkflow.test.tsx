@@ -335,7 +335,91 @@ describe('RequestWorkflow', () => {
     });
   });
 
-  it('does not depend on hidden dispatch token fields in request or shipment list payloads', async () => {
+  it('keeps dispatch qr visible when dispatch response includes token-only delivery_qr', async () => {
+    getAll
+      .mockResolvedValueOnce({
+        data: [{ ...incomingBase, id: 'req-dispatch-token-only', status: 'RESERVED', payment_required: false }],
+      })
+      .mockResolvedValue({
+        data: [{ ...incomingBase, id: 'req-dispatch-token-only', status: 'IN_TRANSIT', payment_required: false }],
+      });
+
+    getById.mockResolvedValue({
+      data: {
+        ...incomingBase,
+        id: 'req-dispatch-token-only',
+        status: 'RESERVED',
+        payment_required: false,
+      },
+    });
+
+    dispatch.mockResolvedValueOnce({
+      data: {
+        id: 'dispatch-record-token-only',
+        request: 'req-dispatch-token-only',
+        shipment: 'shipment-token-only',
+        delivery_qr: {
+          token: 'OPAQUE-TOKEN-ONLY-123',
+          expiresAt: '2026-03-10T14:15:00Z',
+        },
+      },
+    });
+
+    render(<RequestWorkflow />);
+
+    await userEvent.type(await screen.findByPlaceholderText(/vehicle number\/details/i), 'Van-12');
+    await userEvent.click(await screen.findByRole('button', { name: /assign delivery personnel and dispatch/i }));
+
+    await waitFor(() => {
+      expect(dispatch).toHaveBeenCalledWith(
+        'req-dispatch-token-only',
+        expect.objectContaining({
+          notes: expect.stringContaining('Vehicle: Van-12'),
+        })
+      );
+      expect(screen.getByText('Dispatch QR')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /download qr code/i })).toBeInTheDocument();
+      expect(screen.queryByText('OPAQUE-TOKEN-ONLY-123')).not.toBeInTheDocument();
+    });
+  });
+
+  it('prints dispatch QR with preserved wrapper and scanner-friendly print size', async () => {
+    getAll.mockResolvedValueOnce({
+      data: [
+        {
+          ...incomingBase,
+          id: 'req-print-qr',
+          status: 'IN_TRANSIT',
+          payment_required: false,
+          dispatch_qr_payload: 'OPAQUE-PRINT-QR',
+        },
+      ],
+    });
+
+    const writeSpy = vi.fn();
+    const printWindowStub = {
+      document: {
+        write: writeSpy,
+        close: vi.fn(),
+      },
+      focus: vi.fn(),
+      print: vi.fn(),
+      close: vi.fn(),
+      addEventListener: vi.fn(),
+    } as unknown as Window;
+
+    windowOpenSpy.mockReturnValueOnce(printWindowStub);
+
+    render(<RequestWorkflow />);
+
+    await userEvent.click(await screen.findByRole('button', { name: /print qr code/i }));
+
+    expect(windowOpenSpy).toHaveBeenCalled();
+    expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining('qr-print-target'));
+    expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining('width: 420px'));
+  });
+
+  it('renders dispatch qr from token-only shipment fields while workflow is active', async () => {
     getAll.mockResolvedValueOnce({
       data: [
         {
@@ -356,7 +440,8 @@ describe('RequestWorkflow', () => {
 
     render(<RequestWorkflow />);
 
-    await screen.findByText('Ventilator');
+    expect(await screen.findByText('Dispatch QR')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /download qr code/i })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /confirm sender handover/i })).not.toBeInTheDocument();
     expect(screen.queryByText('BUNDLE-DISPATCH-123')).not.toBeInTheDocument();
   });

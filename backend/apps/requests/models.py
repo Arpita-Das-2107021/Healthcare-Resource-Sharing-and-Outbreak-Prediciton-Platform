@@ -6,6 +6,37 @@ from django.db import models
 from django.utils import timezone
 
 
+class RefundCause(models.TextChoices):
+    # Requester-initiated
+    REQUESTER_CANCELLATION = "REQUESTER_CANCELLATION", "Requester Cancellation"
+    REQUESTER_DUPLICATE = "REQUESTER_DUPLICATE", "Requester Duplicate"
+    # Supplier-initiated
+    SUPPLIER_CANCELLATION = "SUPPLIER_CANCELLATION", "Supplier Cancellation"
+    SUPPLIER_FAILURE = "SUPPLIER_FAILURE", "Supplier Failure"
+    SUPPLIER_QUALITY_FAILURE = "SUPPLIER_QUALITY_FAILURE", "Supplier Quality Failure"
+    SUPPLIER_NON_DELIVERY = "SUPPLIER_NON_DELIVERY", "Supplier Non-Delivery"
+    # System/platform
+    SYSTEM_TIMEOUT = "SYSTEM_TIMEOUT", "System Timeout"
+    PAYMENT_GATEWAY_FAILURE = "PAYMENT_GATEWAY_FAILURE", "Payment Gateway Failure"
+    INVENTORY_TRANSFER_FAILURE = "INVENTORY_TRANSFER_FAILURE", "Inventory Transfer Failure"
+    # Compliance/fraud — these cause 0% refund
+    FRAUD_SUSPECTED = "FRAUD_SUSPECTED", "Fraud Suspected"
+    POLICY_VIOLATION = "POLICY_VIOLATION", "Policy Violation"
+    # Operational
+    LOGISTICS_FAILURE = "LOGISTICS_FAILURE", "Logistics Failure"
+    FORCE_MAJEURE = "FORCE_MAJEURE", "Force Majeure"
+
+
+class RefundStatus(models.TextChoices):
+    PENDING_POLICY_EVALUATION = "PENDING_POLICY_EVALUATION", "Pending Policy Evaluation"
+    PENDING_RETURN_VERIFICATION = "PENDING_RETURN_VERIFICATION", "Pending Return Verification"
+    PENDING = "PENDING", "Pending"
+    PROCESSING = "PROCESSING", "Processing"
+    REFUNDED = "REFUNDED", "Refunded"
+    REFUND_FAILED = "REFUND_FAILED", "Refund Failed"
+    CANCELLED = "CANCELLED", "Cancelled"
+
+
 class ResourceRequest(models.Model):
     """
     A hospital requesting a resource from another hospital.
@@ -317,6 +348,8 @@ class RequestOperationIdempotency(models.Model):
         RESERVATION_CREATE = "reservation_create", "Reservation Create"
         PAYMENT_INITIATE = "payment_initiate", "Payment Initiate"
         TRANSFER_CONFIRM = "transfer_confirm", "Transfer Confirm"
+        REFUND_INITIATE = "refund_initiate", "Refund Initiate"
+        REFUND_CONFIRM = "refund_confirm", "Refund Confirm"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     request = models.ForeignKey(
@@ -399,6 +432,12 @@ class PaymentTransaction(models.Model):
                 condition=models.Q(provider_transaction_id__isnull=False),
                 name="uniq_provider_transaction_id",
             ),
+            # Prevents two active (non-terminal) payment rows for the same request+provider.
+            models.UniqueConstraint(
+                fields=["request", "provider"],
+                condition=~models.Q(payment_status__in=["FAILED", "REFUNDED"]),
+                name="uniq_payment_tx_one_active_per_request",
+            ),
         ]
         indexes = [
             models.Index(fields=["payer_hospital", "-created_at"]),
@@ -448,6 +487,14 @@ class PaymentGatewayWebhookEvent(models.Model):
 
     class Meta:
         db_table = "requests_paymentwebhookevent"
+        constraints = [
+            # Prevents processing the same gateway event twice.
+            models.UniqueConstraint(
+                fields=["provider", "provider_transaction_id", "event_type"],
+                condition=models.Q(provider_transaction_id__isnull=False),
+                name="uniq_webhook_event_dedup",
+            ),
+        ]
         indexes = [
             models.Index(fields=["provider", "provider_transaction_id"]),
             models.Index(fields=["processing_status", "-created_at"]),
@@ -636,3 +683,177 @@ class ExternalInventoryAPICallLog(models.Model):
             models.Index(fields=["request", "-created_at"]),
             models.Index(fields=["operation", "-created_at"]),
         ]
+
+
+class RefundPolicyRule(models.Model):
+    """
+    Configurable table mapping (workflow_state, cause) → refund outcome.
+    NULL cause means "default rule for this stage".
+    Lookup priority: exact (state, cause) > (state, NULL) > system fallback (0%, manual).
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    workflow_state = models.CharField(max_length=30)
+    cause = models.CharField(max_length=50, null=True, blank=True)
+    refund_percentage = models.DecimalField(max_digits=5, decimal_places=2)
+    requires_return_verification = models.BooleanField(default=False)
+    gateway_supported = models.BooleanField(default=True)
+    notes = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "requests_refundpolicyrule"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["workflow_state", "cause"],
+                condition=models.Q(is_active=True),
+                name="uniq_refund_policy_rule_active",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["workflow_state", "cause"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"RefundPolicyRule({self.workflow_state}, {self.cause or 'default'}, {self.refund_percentage}%)"
+
+
+class RefundRequest(models.Model):
+    """
+    Authoritative refund lifecycle entity. PaymentTransaction.payment_status is a summary mirror only.
+    One active RefundRequest per PaymentTransaction is enforced by the partial unique index.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    payment_transaction = models.ForeignKey(
+        PaymentTransaction,
+        on_delete=models.CASCADE,
+        related_name="refund_requests",
+    )
+    request = models.ForeignKey(
+        ResourceRequest,
+        on_delete=models.CASCADE,
+        related_name="refund_requests",
+    )
+    cause = models.CharField(max_length=50, choices=RefundCause.choices)
+    cause_note = models.TextField(blank=True)
+    policy_rule = models.ForeignKey(
+        RefundPolicyRule,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="refund_requests",
+    )
+    refund_percentage_applied = models.DecimalField(max_digits=5, decimal_places=2)
+    refund_amount = models.DecimalField(max_digits=12, decimal_places=2)
+    currency = models.CharField(max_length=10, default="BDT")
+    refund_status = models.CharField(
+        max_length=35,
+        choices=RefundStatus.choices,
+        default=RefundStatus.PENDING_POLICY_EVALUATION,
+    )
+    gateway_refund_id = models.CharField(max_length=150, blank=True)
+    gateway_response = models.JSONField(default=dict, blank=True)
+    idempotency_key = models.CharField(max_length=128, unique=True)
+    initiated_by = models.ForeignKey(
+        "authentication.UserAccount",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="initiated_refund_requests",
+    )
+    retry_count = models.IntegerField(default=0)
+    sla_deadline_at = models.DateTimeField(null=True, blank=True)
+    escalated_at = models.DateTimeField(null=True, blank=True)
+    initiated_at = models.DateTimeField(default=timezone.now)
+    processed_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    failed_at = models.DateTimeField(null=True, blank=True)
+    failure_code = models.CharField(max_length=80, blank=True)
+    failure_message = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    # Non-terminal statuses; a second RefundRequest for the same payment is
+    # only allowed once all prior ones have reached REFUND_FAILED or CANCELLED.
+    _ACTIVE_STATUSES = [
+        RefundStatus.PENDING_POLICY_EVALUATION,
+        RefundStatus.PENDING_RETURN_VERIFICATION,
+        RefundStatus.PENDING,
+        RefundStatus.PROCESSING,
+    ]
+
+    class Meta:
+        db_table = "requests_refundrequest"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["payment_transaction"],
+                condition=~models.Q(
+                    refund_status__in=["REFUND_FAILED", "CANCELLED"]
+                ),
+                name="uniq_refund_request_one_active_per_payment",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["refund_status", "-created_at"]),
+            models.Index(fields=["request", "-created_at"]),
+            models.Index(fields=["sla_deadline_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"RefundRequest({self.request_id}, {self.cause}, {self.refund_status})"
+
+
+class PartialReturnRecord(models.Model):
+    """
+    Tracks quantities returned, damaged, and lost for a physical return.
+    Required before gateway refund is triggered when RefundPolicyRule.requires_return_verification=True.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    request = models.ForeignKey(
+        ResourceRequest,
+        on_delete=models.CASCADE,
+        related_name="partial_return_records",
+    )
+    refund_request = models.ForeignKey(
+        RefundRequest,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="partial_return_records",
+    )
+    shipment = models.ForeignKey(
+        "shipments.Shipment",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="partial_return_records",
+    )
+    quantity_returned = models.PositiveIntegerField(default=0)
+    quantity_damaged = models.PositiveIntegerField(default=0)
+    quantity_lost = models.PositiveIntegerField(default=0)
+    return_verified = models.BooleanField(default=False)
+    verified_by = models.ForeignKey(
+        "authentication.UserAccount",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="verified_return_records",
+    )
+    verified_at = models.DateTimeField(null=True, blank=True)
+    verification_notes = models.TextField(blank=True)
+    return_token_used = models.CharField(max_length=128, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "requests_partialreturnrecord"
+        indexes = [
+            models.Index(fields=["request", "return_verified"]),
+            models.Index(fields=["refund_request"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"PartialReturnRecord({self.request_id}, returned={self.quantity_returned}, verified={self.return_verified})"

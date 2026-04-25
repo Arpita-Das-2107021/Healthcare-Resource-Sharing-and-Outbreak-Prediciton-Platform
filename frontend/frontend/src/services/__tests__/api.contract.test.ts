@@ -739,6 +739,21 @@ describe('API contract wrappers', () => {
     );
   });
 
+  it('uses return initiation alias endpoint', async () => {
+    await requestsApi.initiateReturn('request-6', { reason: 'Shipment condition issue' });
+
+    expect(fetch).toHaveBeenCalledWith(
+      'http://localhost:8000/api/v1/requests/request-6/refunds/initiate/',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          cause: 'REQUESTER_CANCELLATION',
+          cause_note: 'Shipment condition issue',
+        }),
+      })
+    );
+  });
+
   it('maps handover confirmation to shipment tracking endpoint', async () => {
     await shipmentsApi.confirmHandover('shipment-9', {
       receiver_name: 'Receiver',

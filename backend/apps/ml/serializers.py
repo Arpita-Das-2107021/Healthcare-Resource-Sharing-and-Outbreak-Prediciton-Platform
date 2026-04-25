@@ -256,47 +256,103 @@ class FacilityMLSettingPatchSerializer(serializers.Serializer):
 class ServerBCallbackSerializer(serializers.Serializer):
     job_id = serializers.UUIDField()
     job_type = serializers.ChoiceField(choices=MLJob.JobType.choices)
-    external_job_id = serializers.CharField(required=False, allow_blank=True)
+    external_job_id = serializers.CharField(required=False, allow_blank=False)
     model_version = serializers.CharField(required=False, allow_blank=True)
     prediction_horizon_days = serializers.IntegerField(min_value=1)
     status = serializers.ChoiceField(choices=["completed", "failed"])
-    completed_at = serializers.DateTimeField(required=False)
-    results = serializers.ListField(child=serializers.JSONField(), required=False, default=list)
-    neighbors = serializers.DictField(child=serializers.ListField(child=serializers.JSONField()), required=False, default=dict)
+    completed_at = serializers.DateTimeField(required=False, allow_null=False)
+    results = serializers.ListField(child=serializers.JSONField(), required=False)
+    neighbors = serializers.DictField(child=serializers.ListField(child=serializers.JSONField()), required=False)
     error = serializers.JSONField(required=False, allow_null=True)
+
+    def validate(self, attrs):
+        required_common = [
+            "external_job_id",
+            "model_version",
+            "completed_at",
+            "results",
+            "error",
+        ]
+        missing = [field for field in required_common if field not in attrs]
+        if missing:
+            raise serializers.ValidationError({"detail": f"missing required callback fields: {', '.join(missing)}"})
+
+        if attrs["job_type"] == MLJob.JobType.OUTBREAK and "neighbors" not in attrs:
+            raise serializers.ValidationError({"neighbors": "neighbors is required for outbreak callbacks."})
+
+        if attrs["job_type"] == MLJob.JobType.FORECAST and "neighbors" in attrs:
+            raise serializers.ValidationError({"neighbors": "neighbors is not allowed for forecast callbacks."})
+
+        if attrs["status"] == "completed":
+            if attrs.get("error") is not None:
+                raise serializers.ValidationError({"error": "error must be null for completed callbacks."})
+            if not isinstance(attrs.get("results"), list):
+                raise serializers.ValidationError({"results": "results must be an array."})
+        else:
+            error_payload = attrs.get("error")
+            if not isinstance(error_payload, dict):
+                raise serializers.ValidationError({"error": "error must be an object for failed callbacks."})
+            if not str(error_payload.get("code") or "").strip():
+                raise serializers.ValidationError({"error": "error.code is required for failed callbacks."})
+            if not str(error_payload.get("message") or "").strip():
+                raise serializers.ValidationError({"error": "error.message is required for failed callbacks."})
+
+        return attrs
 
 
 class _BaseModelPredictSerializer(serializers.Serializer):
     facility_id = serializers.UUIDField(required=False)
     scheduled_time = serializers.DateTimeField(required=False, allow_null=True)
     prediction_horizon_days = serializers.IntegerField(min_value=1, default=1)
-    model_version = serializers.CharField(required=False, allow_blank=True, default="")
+    model_version = serializers.CharField(required=False, allow_blank=False)
     input = serializers.JSONField(required=True)
-    context = serializers.JSONField(required=False, default=dict)
-    parameters = serializers.JSONField(required=False, default=dict)
 
     def validate_input(self, value):
         if not isinstance(value, dict):
             raise serializers.ValidationError("input must be a JSON object.")
         return value
 
-    def validate_context(self, value):
-        if not isinstance(value, dict):
-            raise serializers.ValidationError("context must be a JSON object.")
-        return value
-
-    def validate_parameters(self, value):
-        if not isinstance(value, dict):
-            raise serializers.ValidationError("parameters must be a JSON object.")
-        return value
+    def _validate_rows(self, rows):
+        if not isinstance(rows, list) or not rows:
+            raise serializers.ValidationError({"input": "input.rows must be a non-empty array."})
 
 
 class Model1PredictSerializer(_BaseModelPredictSerializer):
-    pass
+    def validate(self, attrs):
+        input_payload = attrs.get("input") if isinstance(attrs.get("input"), dict) else {}
+        rows = input_payload.get("rows")
+        self._validate_rows(rows)
+
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                raise serializers.ValidationError({"input": f"input.rows[{index}] must be an object."})
+            if not row.get("facility_id"):
+                raise serializers.ValidationError({"input": f"input.rows[{index}].facility_id is required."})
+            if not row.get("resource_catalog_id"):
+                raise serializers.ValidationError({"input": f"input.rows[{index}].resource_catalog_id is required."})
+
+        return attrs
 
 
 class Model2PredictSerializer(_BaseModelPredictSerializer):
     max_neighbors = serializers.IntegerField(min_value=1, default=20)
+
+    def validate(self, attrs):
+        input_payload = attrs.get("input") if isinstance(attrs.get("input"), dict) else {}
+        rows = input_payload.get("rows")
+        self._validate_rows(rows)
+
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                raise serializers.ValidationError({"input": f"input.rows[{index}] must be an object."})
+            if not row.get("facility_id"):
+                raise serializers.ValidationError({"input": f"input.rows[{index}].facility_id is required."})
+
+        neighbors = input_payload.get("neighbors", {})
+        if neighbors is not None and not isinstance(neighbors, dict):
+            raise serializers.ValidationError({"input": "input.neighbors must be an object when provided."})
+
+        return attrs
 
 
 class MLTrainingDatasetGenerateSerializer(serializers.Serializer):
@@ -382,3 +438,21 @@ class MLModelVersionReviewSerializer(serializers.Serializer):
 
 class MLModelVersionRollbackSerializer(serializers.Serializer):
     target_version_id = serializers.UUIDField()
+
+
+# ---------------------------------------------------------------------------
+# Client-facing serializers — no raw ML feature fields, no scheduling fields.
+# ---------------------------------------------------------------------------
+
+class FacilityRefreshSerializer(serializers.Serializer):
+    """Input for the on-demand facility refresh endpoint.
+
+    The backend prepares all ML inputs internally; callers only specify what
+    kind of refresh they want.
+    """
+    job_type = serializers.ChoiceField(
+        choices=MLJob.JobType.choices,
+        default=MLJob.JobType.FORECAST,
+        required=False,
+    )
+    prediction_horizon_days = serializers.IntegerField(min_value=1, default=7, required=False)

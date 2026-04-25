@@ -1,7 +1,34 @@
-"""Views for ML orchestration APIs."""
+"""Views for ML orchestration APIs.
+
+Two API layers live here:
+
+  SECTION A — INTERNAL ML PIPELINE  (ML engineers / background workers only)
+      POST /api/v1/ml/model1/predict/
+      POST /api/v1/ml/model2/predict/
+      POST /api/v1/ml/jobs/            (and sub-routes)
+      POST /api/v1/ml/schedules/       (and sub-routes)
+      GET  /api/v1/ml/jobs/<id>/results/forecast|outbreak/
+      Training & model-version lifecycle routes
+
+  SECTION B — CLIENT-FACING FACILITY INSIGHTS  (authenticated hospital staff)
+      GET  /api/v1/ml/facilities/me/latest-forecast/
+      GET  /api/v1/ml/facilities/<id>/latest-forecast/
+      GET  /api/v1/ml/facilities/me/latest-outbreak/
+      GET  /api/v1/ml/facilities/<id>/latest-outbreak/
+      GET  /api/v1/ml/facilities/me/request-suggestions/
+      GET  /api/v1/ml/facilities/<id>/request-suggestions/
+      POST /api/v1/ml/facilities/me/refresh/
+      POST /api/v1/ml/facilities/<id>/refresh/
+
+Do NOT add raw ML feature fields, scheduled_time, model_version, or
+job-polling concerns to Section B endpoints.
+"""
+import datetime
 import uuid
 
 from rest_framework import status
+from rest_framework.exceptions import NotFound as DRFNotFound
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -10,6 +37,10 @@ from common.permissions.base import (
     CanManageMLModelVersions,
     CanManageMLOperations,
     CanManageMLTrainingLifecycle,
+    CanTriggerFacilityRefresh,
+    CanViewFacilityForecast,
+    CanViewFacilityOutbreak,
+    CanViewFacilitySuggestions,
     CanViewMLForecast,
     CanViewMLJobs,
     CanViewMLOutbreak,
@@ -21,6 +52,7 @@ from .inference_services import create_json_inference_job
 from .serializers import (
     FacilityMLSettingPatchSerializer,
     FacilityMLSettingSerializer,
+    FacilityRefreshSerializer,
     MLJobCancelSerializer,
     MLJobCreateSerializer,
     MLJobEventSerializer,
@@ -56,6 +88,7 @@ from .services import (
     retry_ml_job,
     serialize_job,
     set_schedule_active,
+    trigger_facility_refresh,
     update_facility_settings,
     update_schedule,
 )
@@ -79,6 +112,10 @@ from .training_services import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
 def _request_id(request) -> str:
     return request.headers.get("X-Request-Id") or str(uuid.uuid4())
 
@@ -93,6 +130,69 @@ def _success_response(request, data, *, status_code=status.HTTP_200_OK, meta=Non
         payload["meta"].update(meta)
     return Response(payload, status=status_code)
 
+
+def _validate_or_raise_422(serializer) -> None:
+    if serializer.is_valid():
+        return
+    exc = ValidationError(serializer.errors)
+    exc.status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
+    raise exc
+
+
+def _resolve_facility_id_from_user(user):
+    """Derives facility_id for hospital-scoped users when it is not in the URL."""
+    hospital = getattr(getattr(user, "staff", None), "hospital", None)
+    if not hospital:
+        raise PermissionDenied("Cannot determine facility: user is not associated with any facility.")
+    return hospital.id
+
+
+def _strip_ml_internals(item: dict) -> dict:
+    """Remove internal ML fields that must not be exposed to frontend clients.
+
+    Strips decision_log (ML pipeline debug data) and request_candidates
+    (moved exclusively to the /request-suggestions/ endpoint to avoid duplication).
+    """
+    entry = dict(item)
+    entry.pop("decision_log", None)
+    entry.pop("request_candidates", None)
+    return entry
+
+
+_FORECAST_STALE_HOURS = 24
+_OUTBREAK_STALE_HOURS = 12
+
+
+def _is_stale(completed_at_iso: str | None, stale_hours: int) -> bool:
+    """Returns True when the result is older than stale_hours or has no timestamp."""
+    if not completed_at_iso:
+        return True
+    try:
+        dt = datetime.datetime.fromisoformat(completed_at_iso.replace("Z", "+00:00"))
+        age = datetime.datetime.now(datetime.timezone.utc) - dt
+        return age > datetime.timedelta(hours=stale_hours)
+    except Exception:
+        return True
+
+
+def _error_response(request, code: str, message: str, http_status: int) -> Response:
+    """Return a structured error envelope matching the project standard."""
+    return Response(
+        {
+            "success": False,
+            "error": {"code": code, "message": message},
+            "meta": {"request_id": _request_id(request)},
+        },
+        status=http_status,
+    )
+
+
+# ===========================================================================
+# SECTION A — INTERNAL ML PIPELINE
+# Access: ML_ENGINEER / ML_ADMIN roles (CanManageMLOperations and variants).
+# These endpoints accept raw ML feature inputs, scheduling config, and
+# model versioning fields.  They MUST NOT be called directly by the frontend.
+# ===========================================================================
 
 class MLJobCollectionView(APIView):
     permission_classes = [IsAuthenticated, CanManageMLOperations]
@@ -219,6 +319,7 @@ class MLScheduleDeactivateView(APIView):
 
 
 class MLForecastResultView(APIView):
+    """Internal: raw forecast results tied to a specific job_id, including decision_log."""
     permission_classes = [IsAuthenticated, CanViewMLForecast]
 
     def get(self, request, job_id):
@@ -228,35 +329,12 @@ class MLForecastResultView(APIView):
 
 
 class MLOutbreakResultView(APIView):
+    """Internal: raw outbreak results tied to a specific job_id, including decision_log."""
     permission_classes = [IsAuthenticated, CanViewMLOutbreak]
 
     def get(self, request, job_id):
         job = get_ml_job(job_id, request.user)
         data = get_outbreak_results(job, request.user)
-        return _success_response(request, data)
-
-
-class LatestForecastFacilityView(APIView):
-    permission_classes = [IsAuthenticated, CanViewMLForecast]
-
-    def get(self, request, facility_id):
-        data = get_latest_forecast_for_facility(request.user, facility_id)
-        return _success_response(request, data)
-
-
-class LatestOutbreakFacilityView(APIView):
-    permission_classes = [IsAuthenticated, CanViewMLOutbreak]
-
-    def get(self, request, facility_id):
-        data = get_latest_outbreak_for_facility(request.user, facility_id)
-        return _success_response(request, data)
-
-
-class RequestSuggestionFacilityView(APIView):
-    permission_classes = [IsAuthenticated, CanViewMLSuggestions]
-
-    def get(self, request, facility_id):
-        data = get_request_suggestions(request.user, facility_id)
         return _success_response(request, data)
 
 
@@ -271,34 +349,46 @@ class FacilitySettingsPatchView(APIView):
 
 
 class Model1PredictView(APIView):
+    """Internal: direct JSON-based forecast inference (model1). ML engineers only."""
     permission_classes = [IsAuthenticated, CanManageMLOperations]
 
     def post(self, request):
         serializer = Model1PredictSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = create_json_inference_job(
-            request.user,
-            model_key="model1",
-            validated_data=serializer.validated_data,
-            idempotency_key=request.headers.get("Idempotency-Key", ""),
-        )
+        _validate_or_raise_422(serializer)
+        try:
+            data = create_json_inference_job(
+                request.user,
+                model_key="model1",
+                validated_data=serializer.validated_data,
+                idempotency_key=request.headers.get("Idempotency-Key", ""),
+            )
+        except ValidationError as exc:
+            exc.status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
+            raise exc
         return _success_response(request, data, status_code=status.HTTP_202_ACCEPTED)
 
 
 class Model2PredictView(APIView):
+    """Internal: direct JSON-based outbreak inference (model2). ML engineers only."""
     permission_classes = [IsAuthenticated, CanManageMLOperations]
 
     def post(self, request):
         serializer = Model2PredictSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = create_json_inference_job(
-            request.user,
-            model_key="model2",
-            validated_data=serializer.validated_data,
-            idempotency_key=request.headers.get("Idempotency-Key", ""),
-        )
+        _validate_or_raise_422(serializer)
+        try:
+            data = create_json_inference_job(
+                request.user,
+                model_key="model2",
+                validated_data=serializer.validated_data,
+                idempotency_key=request.headers.get("Idempotency-Key", ""),
+            )
+        except ValidationError as exc:
+            exc.status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
+            raise exc
         return _success_response(request, data, status_code=status.HTTP_202_ACCEPTED)
 
+
+# Training lifecycle — internal, ML engineers / admins only.
 
 class MLTrainingDatasetGenerateView(APIView):
     permission_classes = [IsAuthenticated, CanManageMLTrainingLifecycle]
@@ -456,6 +546,8 @@ class ActiveModelConfigView(APIView):
         return _success_response(request, {"items": items})
 
 
+# Callbacks — no auth; verified via HMAC signature in the service layer.
+
 class ServerBTrainingCallbackView(APIView):
     authentication_classes = []
     permission_classes = [AllowAny]
@@ -463,12 +555,16 @@ class ServerBTrainingCallbackView(APIView):
     def post(self, request):
         raw_payload = request.body.decode("utf-8", errors="ignore")
         serializer = MLTrainingCallbackSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = process_training_callback(
-            serializer.validated_data,
-            request.headers,
-            signature_payload=raw_payload,
-        )
+        _validate_or_raise_422(serializer)
+        try:
+            data = process_training_callback(
+                serializer.validated_data,
+                request.headers,
+                signature_payload=raw_payload,
+            )
+        except ValidationError as exc:
+            exc.status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
+            raise exc
         return _success_response(request, data, status_code=status.HTTP_202_ACCEPTED)
 
 
@@ -479,10 +575,163 @@ class ServerBCallbackView(APIView):
     def post(self, request):
         raw_payload = request.body.decode("utf-8", errors="ignore")
         serializer = ServerBCallbackSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = process_server_b_callback(
-            serializer.validated_data,
-            request.headers,
-            signature_payload=raw_payload,
-        )
+        _validate_or_raise_422(serializer)
+        try:
+            data = process_server_b_callback(
+                serializer.validated_data,
+                request.headers,
+                signature_payload=raw_payload,
+            )
+        except ValidationError as exc:
+            exc.status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
+            raise exc
         return _success_response(request, data, status_code=status.HTTP_202_ACCEPTED)
+
+
+# ===========================================================================
+# SECTION B — CLIENT-FACING FACILITY INSIGHTS
+# Access: authenticated hospital staff (CanViewFacility* / CanTriggerFacilityRefresh).
+# Rules:
+#   - "me" routes resolve facility from request.user.staff.hospital (no URL param).
+#   - explicit <facility_id> routes enforce ownership in the service layer.
+#   - decision_log and request_candidates are stripped from all items.
+#   - Empty results are returned as items:[] instead of raising 404.
+#   - Every response includes status and is_stale fields.
+# ===========================================================================
+
+class FacilityLatestForecastView(APIView):
+    """Latest completed forecast for a facility — ML internals stripped.
+
+    Responds with an empty items list (not 404) when no completed forecast exists yet.
+    """
+    permission_classes = [IsAuthenticated, CanViewFacilityForecast]
+
+    def get(self, request, facility_id=None):
+        resolved_id = facility_id or _resolve_facility_id_from_user(request.user)
+        try:
+            data = get_latest_forecast_for_facility(request.user, resolved_id)
+        except DRFNotFound:
+            return _success_response(request, {
+                "job_id": None,
+                "status": None,
+                "is_stale": True,
+                "completed_at": None,
+                "items": [],
+                "has_partial_failures": False,
+                "partial_failure_count": 0,
+            })
+        clean_items = [_strip_ml_internals(item) for item in data["items"]]
+        return _success_response(request, {
+            "job_id": data["job_id"],
+            "status": "completed",
+            "is_stale": _is_stale(data["completed_at"], _FORECAST_STALE_HOURS),
+            "completed_at": data["completed_at"],
+            "items": clean_items,
+            "has_partial_failures": data["has_partial_failures"],
+            "partial_failure_count": data["partial_failure_count"],
+        })
+
+
+class FacilityLatestOutbreakView(APIView):
+    """Latest completed outbreak assessment for a facility — ML internals stripped.
+
+    Responds with an empty items list (not 404) when no completed outbreak job exists yet.
+    """
+    permission_classes = [IsAuthenticated, CanViewFacilityOutbreak]
+
+    def get(self, request, facility_id=None):
+        resolved_id = facility_id or _resolve_facility_id_from_user(request.user)
+        try:
+            data = get_latest_outbreak_for_facility(request.user, resolved_id)
+        except DRFNotFound:
+            return _success_response(request, {
+                "job_id": None,
+                "status": None,
+                "is_stale": True,
+                "completed_at": None,
+                "items": [],
+                "has_partial_failures": False,
+                "partial_failure_count": 0,
+            })
+        clean_items = [_strip_ml_internals(item) for item in data["items"]]
+        return _success_response(request, {
+            "job_id": data["job_id"],
+            "status": "completed",
+            "is_stale": _is_stale(data["completed_at"], _OUTBREAK_STALE_HOURS),
+            "completed_at": data["completed_at"],
+            "items": clean_items,
+            "has_partial_failures": data["has_partial_failures"],
+            "partial_failure_count": data["partial_failure_count"],
+        })
+
+
+class FacilityRequestSuggestionsView(APIView):
+    """Deduplicated resource request suggestions derived from latest forecast and
+    outbreak results.  This is the ONLY endpoint that exposes request_candidates —
+    they are stripped from /latest-forecast/ and /latest-outbreak/ responses.
+
+    Returns items:[] (not 404) when no forecast data exists yet.
+    """
+    permission_classes = [IsAuthenticated, CanViewFacilitySuggestions]
+
+    def get(self, request, facility_id=None):
+        resolved_id = facility_id or _resolve_facility_id_from_user(request.user)
+        try:
+            data = get_request_suggestions(request.user, resolved_id)
+        except DRFNotFound:
+            return _success_response(request, {
+                "facility_id": str(resolved_id),
+                "items": [],
+            })
+        return _success_response(request, data)
+
+
+class FacilityRefreshView(APIView):
+    """On-demand trigger: queues a new ML inference job for a facility.
+
+    Restricted to users with explicit permission (analytics view, inventory manage,
+    or ml:job.manage) — no role-based fallback (see CanTriggerFacilityRefresh).
+
+    Accepts only job_type + prediction_horizon_days.  Backend prepares all ML
+    feature inputs internally; no raw feature data is accepted from the caller.
+
+    Response includes result_path so the frontend knows exactly where to poll.
+    """
+    permission_classes = [IsAuthenticated, CanTriggerFacilityRefresh]
+
+    def post(self, request, facility_id=None):
+        resolved_id = facility_id or _resolve_facility_id_from_user(request.user)
+        serializer = FacilityRefreshSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        job_type = serializer.validated_data["job_type"]
+        idempotency_key = request.headers.get("Idempotency-Key") or str(uuid.uuid4())
+        try:
+            data = trigger_facility_refresh(
+                user=request.user,
+                facility_id=resolved_id,
+                job_type=job_type,
+                prediction_horizon_days=serializer.validated_data["prediction_horizon_days"],
+                idempotency_key=idempotency_key,
+            )
+        except ValidationError as exc:
+            detail = getattr(exc, "detail", {}) or {}
+            if isinstance(detail, dict) and detail.get("code") == "active_job_exists":
+                return _error_response(
+                    request,
+                    code="active_job_exists",
+                    message="An active job of this type already exists for this facility.",
+                    http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                )
+            exc.status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
+            raise exc
+
+        result_path = (
+            f"/api/v1/ml/facilities/{resolved_id}/latest-forecast/"
+            if job_type == "forecast"
+            else f"/api/v1/ml/facilities/{resolved_id}/latest-outbreak/"
+        )
+        return _success_response(
+            request,
+            {**data, "result_path": result_path},
+            status_code=status.HTTP_202_ACCEPTED,
+        )

@@ -6,6 +6,9 @@ from .models import (
     DispatchEvent,
     PaymentReconciliationRun,
     PaymentTransaction,
+    RefundCause,
+    RefundRequest,
+    RefundStatus,
     ResourceRequest,
     ResourceRequestApproval,
 )
@@ -195,6 +198,10 @@ class ConfirmPaymentSerializer(serializers.Serializer):
 
 class VerifyReturnSerializer(serializers.Serializer):
     return_token = serializers.CharField()
+    quantity_returned = serializers.IntegerField(required=False, min_value=0, allow_null=True)
+    quantity_damaged = serializers.IntegerField(required=False, default=0, min_value=0)
+    quantity_lost = serializers.IntegerField(required=False, default=0, min_value=0)
+    verification_notes = serializers.CharField(required=False, default="", allow_blank=True)
 
 
 class ReserveRequestSerializer(serializers.Serializer):
@@ -240,7 +247,11 @@ class PaymentConfirmSerializer(serializers.Serializer):
 
 
 class RefundInitiateSerializer(serializers.Serializer):
-    reason = serializers.CharField(required=False, default="", allow_blank=True)
+    cause = serializers.ChoiceField(choices=RefundCause.choices)
+    cause_note = serializers.CharField(required=False, default="", allow_blank=True, max_length=500)
+    idempotency_key = serializers.CharField(required=False, default="", allow_blank=True, max_length=128)
+    returned_quantity = serializers.IntegerField(required=False, min_value=0, allow_null=True)
+    damaged_quantity = serializers.IntegerField(required=False, default=0, min_value=0)
 
 
 class RefundConfirmSerializer(serializers.Serializer):
@@ -251,6 +262,38 @@ class RefundConfirmSerializer(serializers.Serializer):
             PaymentTransaction.PaymentStatus.REFUND_FAILED,
         ]
     )
+
+
+class RefundRequestSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RefundRequest
+        fields = [
+            "id",
+            "request",
+            "payment_transaction",
+            "cause",
+            "cause_note",
+            "policy_rule",
+            "refund_percentage_applied",
+            "refund_amount",
+            "currency",
+            "refund_status",
+            "gateway_refund_id",
+            "idempotency_key",
+            "initiated_by",
+            "retry_count",
+            "sla_deadline_at",
+            "escalated_at",
+            "initiated_at",
+            "processed_at",
+            "completed_at",
+            "failed_at",
+            "failure_code",
+            "failure_message",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
 
 
 class PaymentTransactionSerializer(serializers.ModelSerializer):

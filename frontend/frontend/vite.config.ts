@@ -92,6 +92,11 @@ export default defineConfig(() => {
         "@": path.resolve(__dirname, "./src"),
       },
     },
+    optimizeDeps: {
+      // @zxing/library ships mixed CJS/ESM; force Vite to pre-bundle both
+      // packages so the dev-server import-analysis pass can resolve them.
+      include: ['@zxing/browser', '@zxing/library'],
+    },
     test: {
       environment: "jsdom",
       setupFiles: "./src/test/setup.ts",

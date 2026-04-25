@@ -1,349 +1,333 @@
 """
-Phase 3+4 — ST-GNN + Dynamic Optimization
-==========================================
-Spatiotemporal Graph Neural Network for Disease Outbreak Prediction
-Inspired by Paper 1 (VRE GNN) + Paper 2 (Evolve-DGN) + Paper 3 (DGO-ST-GNN)
+train_stgnn_pytorch.py — ST-GNN Training with GOA + Social Media
+=================================================================
+Upgrades:
+  1. Automatically loads best hyperparameters from GOA (best_params.json)
+  2. After prediction: confirms outbreaks using TWO-FACTOR Verification (Sales + Social)
+  3. Safely downgrades massive sales spikes if the internet is quiet.
 
-INSTALL FIRST (run in Anaconda Prompt):
-    pip install torch scikit-learn
+RUN ORDER:
+  python models/optimize_goa.py         ← Step 1: find best params
+  python models/train_stgnn_pytorch.py  ← Step 2: train with those params
 
-THEN RUN:
-    python models/train_stgnn_pytorch.py
+OR just run: python run_all.py  (does everything automatically)
 """
 
-import json
-import os
-import random
+import json, csv, os, random
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ── Reproducibility ───────────────────────────────────────────────────────────
 SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 
-# ── Config ────────────────────────────────────────────────────────────────────
-DATA_PATH    = os.path.join(os.path.dirname(__file__), "../data/graph_dataset.json")
-SEQ_LEN      = 7      # days of history per prediction
-NUM_FEATURES = 5      # disease-group sales features
-HIDDEN_DIM   = 64     # GNN hidden size
-EPOCHS       = 100    # training rounds
-LR           = 0.005  # learning rate
-DROPOUT      = 0.3    # dropout rate
-THRESHOLD    = 0.5    # probability cutoff for outbreak alert
+BASE     = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE, "../data")
 
-# ── DGOA Hyperparameter Optimizer (Paper 3) ───────────────────────────────────
-class DynamicGrasshopperOptimizer:
-    """
-    Simplified Dynamic Grasshopper Optimization Algorithm (DGOA)
-    from Paper 3 (DGO-ST-GNN).
-    Automatically tunes learning rate and dropout every 10 epochs
-    so the model adapts to changing outbreak patterns.
-    """
-    def __init__(self, lr=LR, dropout=DROPOUT, n_agents=5):
-        self.n_agents  = n_agents
-        self.best_lr   = lr
-        self.best_drop = dropout
-        self.agents    = [
-            {"lr":      lr      * random.uniform(0.5, 1.5),
-             "dropout": dropout * random.uniform(0.5, 1.5)}
-            for _ in range(n_agents)
-        ]
+# ── Default hyperparameters ───────────────────────────────────────────────────
+SEQ_LEN      = 7
+NUM_FEATURES = 5
+HIDDEN_DIM   = 64
+EPOCHS       = 500
+LR           = 0.005
+DROPOUT      = 0.3
+THRESHOLD       = 0.5    # binary classification cutoff for metrics (F1, accuracy)
+ALERT_THRESHOLD = 0.60   # minimum model_prob to trigger two-factor alert check
+WATCH           = 0.35
+BATCH_SIZE      = 16
 
-    def update(self, current_loss, epoch):
-        """
-        Update hyperparameters using:
-        - Gaussian mutation  (explore around current best)
-        - Levy flight        (escape local optima)
-        - Opposition-based   (try opposite direction)
-        """
-        # Gaussian mutation
-        for agent in self.agents:
-            agent["lr"]      = max(0.0001, min(0.05,
-                self.best_lr * (1 + 0.1 * random.gauss(0, 1))))
-            agent["dropout"] = max(0.1, min(0.6,
-                self.best_drop * (1 + 0.1 * random.gauss(0, 1))))
+SIGNAL_GROUPS = {
+    "Fever/Flu":0, "Diarrhea":1, "Respiratory":2, "Allergy/Fever":3, "Normal":4
+}
 
-        # Levy flight
-        if random.random() < 0.2:
-            levy_step     = random.paretovariate(1.5) * 0.001
-            self.best_lr  = max(0.0001, self.best_lr + levy_step)
+# ── Step 1: Load GOA optimized parameters ────────────────────────────────────
+PARAMS_PATH = os.path.join(DATA_DIR, "best_params.json")
+if os.path.exists(PARAMS_PATH):
+    with open(PARAMS_PATH) as f:
+        goa_params = json.load(f)
+    LR         = goa_params.get("LR",         LR)
+    HIDDEN_DIM = goa_params.get("HIDDEN_DIM", HIDDEN_DIM)
+    DROPOUT    = goa_params.get("DROPOUT",    DROPOUT)
+    BATCH_SIZE = goa_params.get("BATCH_SIZE", BATCH_SIZE)
+    print(f"\n  GOA Optimized Params loaded:")
+    print(f"     LR={LR:.5f}  HIDDEN_DIM={HIDDEN_DIM}  "
+          f"DROPOUT={DROPOUT:.3f}  BATCH_SIZE={BATCH_SIZE}  "
+          f"(fitness={goa_params.get('goa_fitness',0):.4f})")
+else:
+    print(f"\n  No GOA params found — using defaults")
+    print(f"     LR={LR}  HIDDEN_DIM={HIDDEN_DIM}  DROPOUT={DROPOUT}")
 
-        # Opposition-based learning
-        candidate_lr  = max(0.0001, 0.05 - self.best_lr + 0.0001)
-        if random.random() > 0.7:
-            self.best_lr  = candidate_lr
+# ── Disease detection from sales features ────────────────────────────────────
+def detect_disease(ph_idx, recent_snapshots):
+    """Detect dominant disease by anomaly score (deviation from network mean)."""
+    idx_to_disease = {v:k for k,v in SIGNAL_GROUPS.items()}
+    n_nodes = len(recent_snapshots[0]["node_feats"])
+    ph_sums  = [0.0] * NUM_FEATURES
+    net_sums = [0.0] * NUM_FEATURES
+    for snap in recent_snapshots:
+        for fi in range(NUM_FEATURES):
+            ph_sums[fi]  += snap["node_feats"][ph_idx][fi]
+            net_sums[fi] += sum(snap["node_feats"][nid][fi] for nid in range(n_nodes))
+    net_mean = [net_sums[fi] / n_nodes for fi in range(NUM_FEATURES)]
+    scores   = [(ph_sums[fi] - net_mean[fi]) / (net_mean[fi] + 1e-9)
+                for fi in range(NUM_FEATURES)]
+    scores[4] = -1  # ignore Normal
+    best = scores.index(max(scores))
+    return idx_to_disease.get(best, "Unknown") if max(scores) > 0.05 else "Unknown"
 
-        # Convergence control
-        convergence        = 2 - (2 * epoch / EPOCHS)
-        self.best_lr       = max(0.0001, min(0.01,
-                                 self.best_lr * (convergence * 0.1 + 0.95)))
-        self.best_drop     = max(0.1, min(0.5, self.best_drop))
-        return self.best_lr, self.best_drop
-
-# ── GCN Layer ─────────────────────────────────────────────────────────────────
+# ── Model ─────────────────────────────────────────────────────────────────────
 class GCNLayer(nn.Module):
-    """
-    Graph Convolutional Layer.
-    Each healthcare aggregates sales signals from nearby healthcares.
-    """
-    def __init__(self, in_features, out_features):
+    def __init__(self, in_f, out_f):
         super().__init__()
-        self.linear = nn.Linear(in_features, out_features, bias=True)
+        self.linear = nn.Linear(in_f, out_f, bias=True)
         nn.init.xavier_uniform_(self.linear.weight)
-
     def forward(self, x, adj):
-        h = adj @ x
-        h = self.linear(h)
-        return F.elu(h)
+        return F.elu(self.linear(adj @ x))
 
-# ── ST-GNN Model ──────────────────────────────────────────────────────────────
 class STGNN(nn.Module):
-    """
-    Spatiotemporal GNN
-    ==================
-    Step 1 → GCN layers   : learn which healthcares affect each other
-    Step 2 → GRU          : learn how sales change over 7 days
-    Step 3 → Attention    : focus on the most important days
-    Step 4 → Classifier   : predict outbreak probability per healthcare
-
-    Output: 0.0 (normal) to 1.0 (outbreak) for each healthcare
-    """
     def __init__(self, in_features, hidden, dropout=DROPOUT):
         super().__init__()
-        self.gcn1    = GCNLayer(in_features, hidden)
-        self.gcn2    = GCNLayer(hidden, hidden)
-        self.gru     = nn.GRU(hidden, hidden, batch_first=True,
-                               num_layers=2, dropout=dropout)
-        self.attn    = nn.Linear(hidden, 1)
-        self.dropout = nn.Dropout(dropout)
-        self.fc1     = nn.Linear(hidden, hidden // 2)
-        self.fc2     = nn.Linear(hidden // 2, 1)
-        self.bn1     = nn.BatchNorm1d(hidden)
-        self.bn2     = nn.BatchNorm1d(hidden)
+        self.gcn1 = GCNLayer(in_features, hidden)
+        self.gcn2 = GCNLayer(hidden, hidden)
+        self.gru  = nn.GRU(hidden, hidden, batch_first=True,
+                            num_layers=2, dropout=dropout)
+        self.attn = nn.Linear(hidden, 1)
+        self.drop = nn.Dropout(dropout)
+        self.fc1  = nn.Linear(hidden, hidden//2)
+        self.fc2  = nn.Linear(hidden//2, 1)
+        self.bn1  = nn.BatchNorm1d(hidden)
+        self.bn2  = nn.BatchNorm1d(hidden)
 
     def forward(self, x_seq, adj):
         seq_len, num_nodes, _ = x_seq.shape
-
-        # Step 1: GCN for each time step
-        spatial_out = []
+        out = []
         for t in range(seq_len):
-            h = self.gcn1(x_seq[t], adj)
-            h = self.bn1(h)
-            h = self.dropout(h)
-            h = self.gcn2(h, adj)
-            h = self.bn2(h)
-            spatial_out.append(h.unsqueeze(0))
+            h = self.bn1(self.gcn1(x_seq[t], adj))
+            h = self.bn2(self.gcn2(self.drop(h), adj))
+            out.append(h.unsqueeze(0))
+        seq = torch.cat(out,0).permute(1,0,2)
+        g,_ = self.gru(seq)
+        ctx = (torch.softmax(self.attn(g),1)*g).sum(1)
+        return torch.sigmoid(self.fc2(F.elu(self.fc1(self.drop(ctx))))).squeeze()
 
-        # (num_nodes, seq_len, hidden)
-        spatial_seq = torch.cat(spatial_out, dim=0).permute(1, 0, 2)
-
-        # Step 2: GRU over 7-day sequence
-        gru_out, _ = self.gru(spatial_seq)
-
-        # Step 3: Attention over time steps
-        attn_weights = torch.softmax(self.attn(gru_out), dim=1)
-        context      = (attn_weights * gru_out).sum(dim=1)
-
-        # Step 4: Classify
-        h   = F.elu(self.fc1(self.dropout(context)))
-        out = torch.sigmoid(self.fc2(h))
-        return out.squeeze()
-
-# ── Data Loading ──────────────────────────────────────────────────────────────
+# ── Data loading ──────────────────────────────────────────────────────────────
 def load_data():
-    with open(DATA_PATH) as f:
-        data = json.load(f)
-
+    graph_path = os.path.join(DATA_DIR,"graph_dataset.json")
+    with open(graph_path) as f: data = json.load(f)
     num_nodes = len(data[0]["node_ids"])
 
-    # Normalized adjacency matrix with self-loops
     adj = torch.zeros(num_nodes, num_nodes)
     for e in data[0]["edges"]:
-        i, j      = e["from_idx"], e["to_idx"]
-        w         = 1.0 / (e["distance_km"] + 1e-6)
-        adj[i][j] = w
-        adj[j][i] = w
-    adj    += torch.eye(num_nodes)
-    adj     = adj / adj.sum(dim=1, keepdim=True).clamp(min=1e-9)
+        i,j = e["from_idx"],e["to_idx"]
+        w   = 1.0/(e["distance_km"]+1e-6)
+        adj[i][j]=w; adj[j][i]=w
+    adj += torch.eye(num_nodes)
+    adj  = adj/adj.sum(1,keepdim=True).clamp(min=1e-9)
 
-    # Sliding window sequences
-    sequences = []
+    seqs = []
     for t in range(SEQ_LEN, len(data)):
-        X = torch.tensor(
-            [data[t - SEQ_LEN + s]["node_feats"] for s in range(SEQ_LEN)],
-            dtype=torch.float32)
+        X = torch.tensor([data[t-SEQ_LEN+s]["node_feats"] for s in range(SEQ_LEN)],
+                          dtype=torch.float32)
         y = torch.tensor(data[t]["node_labels"], dtype=torch.float32)
-        sequences.append((X, y))
+        seqs.append((X,y))
 
-    return sequences, adj, data[0]["node_ids"]
+    return seqs, adj, data[0]["node_ids"], data
 
-# ── Metrics ───────────────────────────────────────────────────────────────────
 def compute_metrics(pred, true):
-    pred_bin = (pred >= THRESHOLD).float()
-    acc  = (pred_bin == true).float().mean().item()
-    tp   = ((pred_bin == 1) & (true == 1)).float().sum().item()
-    fp   = ((pred_bin == 1) & (true == 0)).float().sum().item()
-    fn   = ((pred_bin == 0) & (true == 1)).float().sum().item()
-    prec = tp / (tp + fp + 1e-9)
-    rec  = tp / (tp + fn + 1e-9)
-    f1   = 2 * prec * rec / (prec + rec + 1e-9)
-    return acc, prec, rec, f1
+    pb  = (pred>=THRESHOLD).float()
+    acc = (pb==true).float().mean().item()
+    tp  = ((pb==1)&(true==1)).float().sum().item()
+    fp  = ((pb==1)&(true==0)).float().sum().item()
+    fn  = ((pb==0)&(true==1)).float().sum().item()
+    pr  = tp/(tp+fp+1e-9); re=tp/(tp+fn+1e-9)
+    return acc, pr, re, 2*pr*re/(pr+re+1e-9)
 
 # ── Training ──────────────────────────────────────────────────────────────────
 def train():
-    print("\n" + "═"*60)
-    print("  Phase 3+4 — ST-GNN + DGOA")
-    print("  Disease Outbreak Prediction System")
-    print("═"*60)
+    print("\n"+"="*65)
+    print("  Phase 3+4 — ST-GNN Training")
+    print("  Disease Outbreak Prediction")
+    print("="*65)
 
-    sequences, adj, node_ids = load_data()
+    seqs, adj, node_ids, all_data = load_data()
     num_nodes = len(node_ids)
+    split      = int(0.8*len(seqs))
+    tr, te     = seqs[:split], seqs[split:]
 
-    # 80/20 split
-    split      = int(0.8 * len(sequences))
-    train_data = sequences[:split]
-    test_data  = sequences[split:]
+    all_labels = torch.cat([y for _,y in tr])
+    pos = all_labels.sum().item(); neg = len(all_labels)-pos
+    pos_weight = torch.tensor([neg/(pos+1e-9)])
 
-    print(f"\n  Healthcares     : {num_nodes}")
-    print(f"  Train sequences: {len(train_data)}")
-    print(f"  Test sequences : {len(test_data)}")
+    print(f"\n  Pharmacies : {num_nodes}")
+    print(f"  Train seqs : {len(tr)}  |  Test seqs: {len(te)}")
+    print(f"  Outbreak % : {100*pos/len(all_labels):.1f}%")
+    print(f"  LR         : {LR}  |  Hidden: {HIDDEN_DIM}  |  Dropout: {DROPOUT}")
 
-    # Class imbalance weight
-    all_labels = torch.cat([y for _, y in train_data])
-    pos        = all_labels.sum().item()
-    neg        = len(all_labels) - pos
-    pos_weight = torch.tensor([neg / (pos + 1e-9)])
-    print(f"  Outbreak ratio : {100*pos/len(all_labels):.1f}% positive")
-
-    # Model + optimizer + DGOA
     model     = STGNN(NUM_FEATURES, HIDDEN_DIM, DROPOUT)
-    optimizer = torch.optim.Adam(model.parameters(),
-                                  lr=LR, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer,
-                                                  step_size=20, gamma=0.7)
-    dgoa      = DynamicGrasshopperOptimizer()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.85)
 
-    print(f"  Model params   : {sum(p.numel() for p in model.parameters()):,}")
+    print(f"  Params     : {sum(p.numel() for p in model.parameters()):,}")
     print(f"\n  Training {EPOCHS} epochs...")
-    print("─"*60)
-    print(f"  {'Epoch':>5}  {'Loss':>7}  {'Acc':>6}  "
-          f"{'Prec':>6}  {'Rec':>6}  {'F1':>6}  {'LR':>8}")
-    print("─"*60)
+    print("-"*65)
+    print(f"  {'Epoch':>5}  {'Loss':>7}  {'Acc':>6}  {'Prec':>6}  {'Rec':>6}  {'F1':>6}")
+    print("-"*65)
 
-    best_f1    = 0
-    best_state = None
+    best_f1=0; best_state=None
 
-    for epoch in range(1, EPOCHS + 1):
-        model.train()
-        total_loss = 0
-        random.shuffle(train_data)
-
-        for X, y in train_data:
-            optimizer.zero_grad()
-            pred   = model(X, adj)
-            weight = torch.where(y == 1,
-                                  pos_weight.expand_as(y),
-                                  torch.ones_like(y))
-            loss   = F.binary_cross_entropy(pred, y, weight=weight)
+    for epoch in range(1,EPOCHS+1):
+        model.train(); total_loss=0; random.shuffle(tr)
+        optimizer.zero_grad()
+        for bi,(X,y) in enumerate(tr):
+            pred = model(X,adj)
+            w    = torch.where(y==1,pos_weight.expand_as(y),torch.ones_like(y))
+            loss = F.binary_cross_entropy(pred,y,weight=w) / BATCH_SIZE
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            total_loss += loss.item()
-
+            total_loss += loss.item() * BATCH_SIZE
+            if (bi+1) % BATCH_SIZE == 0 or bi == len(tr)-1:
+                nn.utils.clip_grad_norm_(model.parameters(),1.0)
+                optimizer.step()
+                optimizer.zero_grad()
         scheduler.step()
 
-        # DGOA update every 10 epochs
-        if epoch % 10 == 0:
-            new_lr, new_drop = dgoa.update(total_loss / len(train_data), epoch)
-            for g in optimizer.param_groups:
-                g["lr"] = new_lr
-            for m in model.modules():
-                if isinstance(m, nn.Dropout):
-                    m.p = new_drop
-
-        # Evaluate every 10 epochs
-        if epoch % 10 == 0 or epoch == 1:
+        if epoch%10==0 or epoch==1:
             model.eval()
-            all_pred, all_true = [], []
+            ap,at=[],[]
             with torch.no_grad():
-                for X, y in test_data:
-                    all_pred.append(model(X, adj))
-                    all_true.append(y)
+                for X,y in te:
+                    ap.append(model(X,adj)); at.append(y)
+            ap=torch.cat(ap); at=torch.cat(at)
+            acc,pr,re,f1 = compute_metrics(ap,at)
+            avg = total_loss/len(tr)
+            if f1>best_f1: best_f1=f1; best_state={k:v.clone() for k,v in model.state_dict().items()}
+            print(f"  {epoch:>5}  {avg:>7.4f}  {acc:>6.3f}  {pr:>6.3f}  {re:>6.3f}  {f1:>6.3f}")
 
-            all_pred = torch.cat(all_pred)
-            all_true = torch.cat(all_true)
-            acc, prec, rec, f1 = compute_metrics(all_pred, all_true)
-            avg_loss = total_loss / len(train_data)
-
-            if f1 > best_f1:
-                best_f1    = f1
-                best_state = {k: v.clone() for k, v in model.state_dict().items()}
-
-            print(f"  {epoch:>5}  {avg_loss:>7.4f}  {acc:>6.3f}  "
-                  f"{prec:>6.3f}  {rec:>6.3f}  {f1:>6.3f}  "
-                  f"{dgoa.best_lr:>8.5f}")
-
-    print("─"*60)
+    print("-"*65)
     print(f"\n  Best F1: {best_f1:.3f}")
+    if best_state: model.load_state_dict(best_state)
 
-    # Load best weights
-    if best_state:
-        model.load_state_dict(best_state)
-
-    # ── Final predictions ──────────────────────────────────────────────────────
-    import csv
-    healthcares = {}
-    with open(os.path.join(os.path.dirname(__file__),
-                           "../data/healthcares.csv")) as f:
-        for row in csv.DictReader(f):
-            healthcares[row["healthcare_id"]] = row
+    # ── Load pharmacies for display ────────────────────────────────────────────
+    pharmacies = {}
+    ph_path = os.path.join(DATA_DIR, "pharmacies.csv")
+    fa_path = os.path.join(DATA_DIR, "facilities.csv")
+    if os.path.exists(ph_path):
+        with open(ph_path) as f:
+            for row in csv.DictReader(f):
+                pharmacies[row["pharmacy_id"]] = row
+    elif os.path.exists(fa_path):
+        with open(fa_path) as f:
+            for row in csv.DictReader(f):
+                pharmacies[row["facility_id"]] = row
 
     model.eval()
-    last_X, last_y = test_data[-1]
-    with torch.no_grad():
-        preds = model(last_X, adj)
+    last_X, last_y = te[-1]
+    recent_snaps   = all_data[-SEQ_LEN:]
+    with torch.no_grad(): preds = model(last_X,adj)
 
-    print("\n" + "═"*60)
-    print("  Predictions — Last snapshot")
-    print("─"*60)
-    print(f"  {'ID':<8} {'Upazila':<22} {'Prob':>5}  Status")
-    print("─"*60)
+    # ── Social media confirmation ──────────────────────────────────────────────
+    print("\n  Loading social media hashtag scores...")
+    try:
+        from social_media_analyzer import load_hashtag_scores, get_combined_confidence
+        snap_dates    = {snap["date"] for snap in recent_snaps}
+        social_scores = load_hashtag_scores(target_dates=snap_dates)
+        use_social    = True
+        print("  Social media data loaded")
+    except Exception as e:
+        print(f"  Social media not available: {e}")
+        social_scores = {}
+        use_social    = False
 
-    alerts = 0
-    for i, ph_id in enumerate(node_ids):
-        ph   = healthcares.get(ph_id, {})
-        prob = preds[i].item()
-        true = last_y[i].item()
-        if prob >= THRESHOLD:
-            status = "⚠  OUTBREAK ALERT"
-            alerts += 1
+    print("\n"+"="*80)
+    print("  Final Predictions — ST-GNN + Social Media Confirmation")
+    print("="*80)
+    if use_social:
+        print(f"  {'ID':<8} {'Upazila':<20} {'Model%':>7} {'Social':>7} "
+              f"{'Final%':>7}  {'Disease':<18} Confirmation")
+    else:
+        print(f"  {'ID':<8} {'Upazila':<20} {'Risk%':>7}  {'Status':<18} Disease")
+    print("-"*80)
+
+    alerts=watches=0
+    results=[]
+    for i,ph_id in enumerate(node_ids):
+        ph      = pharmacies.get(ph_id,{})
+        prob    = preds[i].item()
+        upazila = ph.get("upazila","")
+        disease = detect_disease(i, recent_snaps) if prob>=WATCH else "—"
+        true    = last_y[i].item()
+
+        if use_social and prob >= WATCH and disease != "—":
+            _, sscore, _ = get_combined_confidence(prob, upazila, disease, social_scores)
         else:
-            status = "   Normal"
-        true_str = "(true: Outbreak)" if true == 1 else "(true: Normal)"
-        print(f"  {ph_id:<8} {ph.get('upazila',''):<22} "
-              f"{prob:>5.3f}  {status}  {true_str}")
+            sscore = 0.0
 
-    print("─"*60)
-    print(f"\n  {alerts}/{num_nodes} healthcares flagged for outbreak")
+        model_prob   = float(prob)
+        social_score = float(sscore)
+
+        # --- TWO-FACTOR VERIFICATION LOGIC ---
+        if model_prob >= ALERT_THRESHOLD:
+            if social_score >= 0.10:
+                csv_status = "ALERT"
+                conf       = "(Confirmed by Social Media)"
+                alerts    += 1
+            else:
+                csv_status = "Normal"
+                conf       = "(Sales Spike Only - No Social Signal)"
+                disease    = "—"
+        elif model_prob >= WATCH:
+            csv_status = "WATCH"
+            conf       = "(Elevated Risk - Monitor)"
+            watches   += 1
+        else:
+            csv_status = "Normal"
+            conf       = "(Normal)"
+            disease    = "—"
+
+        true_str = "(Outbreak)" if true==1 else "(Normal)"
+        if use_social:
+            print(f"  {ph_id:<8} {upazila:<20} {prob*100:>6.1f}% "
+                  f"{sscore:>7.3f} {model_prob*100:>6.1f}%  "
+                  f"{disease:<18} {conf} {true_str}")
+        else:
+            print(f"  {ph_id:<8} {upazila:<20} {prob*100:>6.1f}%  "
+                  f"{csv_status:<18} {disease} {true_str}")
+
+        results.append({
+            "pharmacy_id":    ph_id,
+            "upazila":        upazila,
+            "model_prob":     round(prob,4),
+            "social_score":   round(sscore,4),
+            "final_confidence": round(model_prob,4),
+            "status":         csv_status,
+            "likely_disease": disease,
+            "social_confirmation": conf,
+        })
+
+    print("-"*80)
+    print(f"\n  {alerts} OUTBREAK RISK  |  {watches} WATCH  "
+          f"|  {len(node_ids)-alerts-watches} Normal")
 
     # Save model
-    save_path = os.path.join(os.path.dirname(__file__), "stgnn_model.pt")
-    torch.save({"model_state": model.state_dict(),
-                "node_ids":    node_ids,
-                "config":      {"in_features": NUM_FEATURES,
-                                "hidden_dim":  HIDDEN_DIM,
-                                "best_f1":     best_f1}},
-               save_path)
+    save_path = os.path.join(BASE,"stgnn_model.pt")
+    torch.save({"model_state":model.state_dict(),"node_ids":node_ids,
+                "config":{"in_features":NUM_FEATURES,"hidden_dim":HIDDEN_DIM,
+                           "dropout":DROPOUT,"best_f1":best_f1}}, save_path)
+    print(f"\n  Model saved → {save_path}")
 
-    print(f"\n  ✓ Model saved → {save_path}")
-    print("\n" + "═"*60)
+    # Save predictions
+    if not results:
+        print("  No results to save.")
+        return
+    pred_path = os.path.join(DATA_DIR,"predictions.csv")
+    with open(pred_path,"w",newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(results[0].keys()))
+        w.writeheader(); w.writerows(results)
+    print(f"  Predictions saved → {pred_path}")
+
+    print("\n"+"="*65)
     print("  Phase 3+4 Complete!")
-    print("  Next after April 4: collect real data → retrain")
-    print("═"*60)
+    print("="*65)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     train()

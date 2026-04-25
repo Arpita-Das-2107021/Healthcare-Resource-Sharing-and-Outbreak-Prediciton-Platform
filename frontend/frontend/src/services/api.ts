@@ -1,3 +1,5 @@
+import { REFUND_CAUSE } from '@/types/refund';
+
 /**
  * API Service for Hospital Resource Sharing System
  *
@@ -1017,6 +1019,18 @@ export const mlApi = {
     apiRequest<unknown>(`/api/v1/ml/schedules/${scheduleId}/deactivate/`, {
       method: 'POST',
     }),
+
+  refresh: (
+    facilityId: string,
+    data: {
+      job_type?: 'forecast' | 'outbreak';
+      prediction_horizon_days?: number;
+    } = {},
+  ) =>
+    apiRequest<unknown>(`/api/v1/ml/facilities/${facilityId}/refresh/`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 };
 
 // ─── Resource Shares ──────────────────────────────────────────────────────────
@@ -1174,10 +1188,27 @@ export const requestsApi = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
-  initiateRefund: (id: string, data: { reason?: string } = {}) =>
+  initiateRefund: (
+    id: string,
+    data: {
+      cause: string;
+      cause_note?: string;
+      idempotency_key?: string;
+      returned_quantity?: number | null;
+      damaged_quantity?: number;
+    }
+  ) =>
     apiRequest<unknown>(`/api/v1/requests/${id}/refunds/initiate/`, {
       method: 'POST',
       body: JSON.stringify(data),
+    }),
+  initiateReturn: (id: string, data: { reason: string }) =>
+    apiRequest<unknown>(`/api/v1/requests/${id}/refunds/initiate/`, {
+      method: 'POST',
+      body: JSON.stringify({
+        cause: REFUND_CAUSE.REQUESTER_CANCELLATION,
+        cause_note: data.reason,
+      }),
     }),
   confirmRefund: (
     id: string,
@@ -1187,6 +1218,8 @@ export const requestsApi = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+  getRefundStatus: (id: string) =>
+    apiRequest<unknown>(`/api/v1/requests/${id}/refunds/status/`),
   expire: (limit?: number) =>
     apiRequest<unknown>('/api/v1/requests/expire/', {
       method: 'POST',
@@ -1200,7 +1233,16 @@ export const requestsApi = {
     apiRequest<unknown>(`/api/v1/requests/${id}/`, {
       method: 'DELETE',
     }),
-  verifyReturn: (id: string, data: { return_token: string }) =>
+  verifyReturn: (
+    id: string,
+    data: {
+      return_token: string;
+      quantity_returned?: number | null;
+      quantity_damaged?: number;
+      quantity_lost?: number;
+      verification_notes?: string;
+    }
+  ) =>
     apiRequest<unknown>(`/api/v1/requests/${id}/verify-return/`, {
       method: 'POST',
       body: JSON.stringify(data),

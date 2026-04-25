@@ -34,12 +34,15 @@ type VisibilityItem = {
   type: VisibilityResourceType;
   totalQuantity: number;
   sharedQuantity: number;
+  costPerUnit: number | null;
   shareRecordId?: string;
 };
 
 type InventoryTypeLookup = {
   byInventoryId: Map<string, VisibilityResourceType>;
   byCatalogItemId: Map<string, VisibilityResourceType>;
+  costByInventoryId: Map<string, number>;
+  costByCatalogItemId: Map<string, number>;
 };
 
 type UnknownRecord = Record<string, unknown>;
@@ -48,6 +51,26 @@ const isRecord = (value: unknown): value is UnknownRecord => typeof value === 'o
 
 const getErrorMessage = (error: unknown): string =>
   error instanceof Error && error.message ? error.message : 'Please try again.';
+
+const toNullableNumber = (value: unknown): number | null => {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const formatCurrency = (value: number | null): string => {
+  if (value === null) {
+    return '-';
+  }
+
+  return `\u09f3${value.toLocaleString(undefined, {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
+  })}`;
+};
 
 const normalizeType = (value: string): VisibilityResourceType | null => {
   const v = (value || '').toLowerCase().trim();
@@ -64,6 +87,8 @@ const normalizeType = (value: string): VisibilityResourceType | null => {
 const buildInventoryTypeLookup = (items: unknown[]): InventoryTypeLookup => {
   const byInventoryId = new Map<string, VisibilityResourceType>();
   const byCatalogItemId = new Map<string, VisibilityResourceType>();
+  const costByInventoryId = new Map<string, number>();
+  const costByCatalogItemId = new Map<string, number>();
 
   items.forEach((item) => {
     const row = isRecord(item) ? item : {};
@@ -76,6 +101,12 @@ const buildInventoryTypeLookup = (items: unknown[]): InventoryTypeLookup => {
         row.catalog_item_type ||
         row.type ||
         ''
+    );
+    const unitCost = toNullableNumber(
+      row.price_per_unit ??
+        row.unit_price ??
+        row.current_unit_price ??
+        row.price_snapshot
     );
 
     const normalizedType = normalizeType(rawType);
@@ -90,9 +121,19 @@ const buildInventoryTypeLookup = (items: unknown[]): InventoryTypeLookup => {
     if (catalogItemId && !byCatalogItemId.has(catalogItemId)) {
       byCatalogItemId.set(catalogItemId, normalizedType);
     }
+
+    if (unitCost !== null) {
+      if (inventoryId && !costByInventoryId.has(inventoryId)) {
+        costByInventoryId.set(inventoryId, unitCost);
+      }
+
+      if (catalogItemId && !costByCatalogItemId.has(catalogItemId)) {
+        costByCatalogItemId.set(catalogItemId, unitCost);
+      }
+    }
   });
 
-  return { byInventoryId, byCatalogItemId };
+  return { byInventoryId, byCatalogItemId, costByInventoryId, costByCatalogItemId };
 };
 
 const resolveVisibilityType = (
@@ -185,6 +226,22 @@ const mapVisibilityItem = (item: unknown, inventoryTypeLookup?: InventoryTypeLoo
     'Unknown item';
 
   const shareRecordId = source.share_record_id || source.resource_share_id || source.share_id;
+  const inventoryMatchedCost = inventoryId ? inventoryTypeLookup?.costByInventoryId.get(inventoryId) : null;
+  const catalogMatchedCost = catalogItemId ? inventoryTypeLookup?.costByCatalogItemId.get(catalogItemId) : null;
+  const costPerUnit = toNullableNumber(
+    source.price_per_unit ??
+      source.unit_price ??
+      source.current_unit_price ??
+      source.price_snapshot ??
+      source.cost_per_unit ??
+      source.costPerUnit ??
+      details?.price_per_unit ??
+      details?.unit_price ??
+      catalogItemObj?.price_per_unit ??
+      catalogItemObj?.unit_price ??
+      inventoryMatchedCost ??
+      catalogMatchedCost
+  );
 
   return {
     id: String(source.id || inventoryId || catalogItemId || crypto.randomUUID()),
@@ -194,6 +251,7 @@ const mapVisibilityItem = (item: unknown, inventoryTypeLookup?: InventoryTypeLoo
     type: resolveVisibilityType(source, inventoryTypeLookup),
     totalQuantity: Number.isFinite(totalQty) ? totalQty : 0,
     sharedQuantity: Number.isFinite(sharedQty) ? sharedQty : 0,
+    costPerUnit,
     shareRecordId: shareRecordId != null ? String(shareRecordId) : undefined,
   };
 };
@@ -374,6 +432,7 @@ const ResourceVisibility = () => {
         title: 'Share quantity updated',
         description: `${item.name} shared quantity set to ${sharedQuantity}.`,
       });
+      window.dispatchEvent(new Event(RESOURCE_SHARES_UPDATED_EVENT));
     } catch (err: unknown) {
       toast({
         title: 'Failed to update share quantity',
@@ -660,6 +719,10 @@ const ResourceVisibility = () => {
                       <span className="font-medium">{selectedItem.sharedQuantity}</span>
                     </div>
                     <div className="flex items-center justify-between gap-3">
+                      <span className="text-muted-foreground">Cost per unit</span>
+                      <span className="font-medium">{formatCurrency(selectedItem.costPerUnit)}</span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
                       <span className="text-muted-foreground">Visibility</span>
                       <Badge variant={selectedItem.sharedQuantity > 0 ? 'outline' : 'secondary'}>
                         {selectedItem.sharedQuantity > 0 ? 'Visible' : 'Hidden'}
@@ -692,13 +755,14 @@ const ResourceVisibility = () => {
               </div>
             ) : (
               <div className="mt-4 overflow-x-auto rounded-lg border border-border/60">
-                <table className="w-full min-w-[680px] text-sm">
+                <table className="w-full min-w-[760px] text-sm">
                   <thead className="bg-muted/40 text-muted-foreground">
                     <tr>
                       <th className="px-4 py-3 text-left font-medium">Resource</th>
                       <th className="px-4 py-3 text-left font-medium">Type</th>
                       <th className="px-4 py-3 text-left font-medium">Total</th>
                       <th className="px-4 py-3 text-left font-medium">Shared</th>
+                      <th className="px-4 py-3 text-left font-medium">Cost</th>
                       <th className="px-4 py-3 text-left font-medium">Visibility</th>
                     </tr>
                   </thead>
@@ -730,6 +794,7 @@ const ResourceVisibility = () => {
                           <td className="px-4 py-3 tracking-wide text-xs text-muted-foreground">{getTypeLabel(item.type)}</td>
                           <td className="px-4 py-3">{item.totalQuantity}</td>
                           <td className="px-4 py-3">{item.sharedQuantity}</td>
+                          <td className="px-4 py-3">{formatCurrency(item.costPerUnit)}</td>
                           <td className="px-4 py-3">
                             <Badge variant={item.sharedQuantity > 0 ? 'outline' : 'secondary'}>
                               {item.sharedQuantity > 0 ? 'Visible' : 'Hidden'}

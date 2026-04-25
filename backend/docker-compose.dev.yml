@@ -29,7 +29,7 @@ services:
       - ML_TRAINING_MIRROR_MAX_RETRIES=3
       - ML_TRAINING_MIRROR_BACKOFF_SECONDS=1
       - ML_TRAINING_MIRROR_DEAD_LETTER_LOG_PATH=/app/logs/ml_training_mirror_dead_letter.jsonl
-      - ML_SERVER_B_MINIO_ENDPOINT_URL=http://host.docker.internal:9200
+      - ML_SERVER_B_MINIO_ENDPOINT_URL=http://host.docker.internal:9100
       - ML_SERVER_B_MINIO_ACCESS_KEY=minioadmin
       - ML_SERVER_B_MINIO_SECRET_KEY=minioadmin
       - ML_SERVER_B_MINIO_REGION_NAME=us-east-1
@@ -103,7 +103,7 @@ services:
       - ML_TRAINING_MIRROR_MAX_RETRIES=3
       - ML_TRAINING_MIRROR_BACKOFF_SECONDS=1
       - ML_TRAINING_MIRROR_DEAD_LETTER_LOG_PATH=/app/logs/ml_training_mirror_dead_letter.jsonl
-      - ML_SERVER_B_MINIO_ENDPOINT_URL=http://host.docker.internal:9200
+      - ML_SERVER_B_MINIO_ENDPOINT_URL=http://host.docker.internal:9100
       - ML_SERVER_B_MINIO_ACCESS_KEY=minioadmin
       - ML_SERVER_B_MINIO_SECRET_KEY=minioadmin
       - ML_SERVER_B_MINIO_REGION_NAME=us-east-1
@@ -157,7 +157,7 @@ services:
       - ML_TRAINING_MIRROR_MAX_RETRIES=3
       - ML_TRAINING_MIRROR_BACKOFF_SECONDS=1
       - ML_TRAINING_MIRROR_DEAD_LETTER_LOG_PATH=/app/logs/ml_training_mirror_dead_letter.jsonl
-      - ML_SERVER_B_MINIO_ENDPOINT_URL=http://host.docker.internal:9200
+      - ML_SERVER_B_MINIO_ENDPOINT_URL=http://host.docker.internal:9100
       - ML_SERVER_B_MINIO_ACCESS_KEY=minioadmin
       - ML_SERVER_B_MINIO_SECRET_KEY=minioadmin
       - ML_SERVER_B_MINIO_REGION_NAME=us-east-1
@@ -224,6 +224,7 @@ services:
       - minio_dev_data:/data
     ports:
       - "9100:9000"
+      - "9200:9000"
       - "9101:9001"
     restart: unless-stopped
 
@@ -286,7 +287,7 @@ services:
       - ML_CALLBACK_ACCEPT_SERVER_B_SHA256=true
       - ML_CALLBACK_ACCEPT_LEGACY_HMAC=true
       - ML_TRAINING_MIRROR_ENABLED=true
-      - ML_SERVER_B_MINIO_ENDPOINT_URL=http://host.docker.internal:9200
+      - ML_SERVER_B_MINIO_ENDPOINT_URL=http://host.docker.internal:9100
       - ML_SERVER_B_MINIO_ACCESS_KEY=minioadmin
       - ML_SERVER_B_MINIO_SECRET_KEY=minioadmin
       - ML_SERVER_B_MINIO_REGION_NAME=us-east-1

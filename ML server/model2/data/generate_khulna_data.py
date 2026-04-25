@@ -1,4 +1,4 @@
-"""
+﻿"""
 Khulna District — Shared Dataset Generator
 ============================================
 Generates one dataset used by BOTH:
@@ -17,36 +17,36 @@ random.seed(99)
 
 OUT = os.path.dirname(os.path.abspath(__file__))
 
-# ── 1. Healthcares — Khulna District ──────────────────────────────────────────
+# ── 1. Facilities — Khulna District ──────────────────────────────────────────
 # 5 upazilas of Khulna with real approximate GPS coordinates
 HEALTHCARES = []
 raw = [
     # (name,                      upazila,          base_lat,  base_lon)
-    ("Al-Amin Healthcare",          "Khulna Sadar",   22.8456,   89.5403),
+    ("Al-Amin Facility",          "Khulna Sadar",   22.8456,   89.5403),
     ("Rahman Drug House",         "Khulna Sadar",   22.8501,   89.5441),
     ("Noor Medicine Corner",      "Khulna Sadar",   22.8389,   89.5367),
-    ("City Healthcare",             "Khulna Sadar",   22.8523,   89.5489),
+    ("City Facility",             "Khulna Sadar",   22.8523,   89.5489),
     ("Popular Drug Store",        "Khulna Sadar",   22.8412,   89.5312),
-    ("Bismillah Healthcare",        "Sonadanga",      22.8678,   89.5534),
+    ("Bismillah Facility",        "Sonadanga",      22.8678,   89.5534),
     ("New Life Medicine",         "Sonadanga",      22.8712,   89.5567),
     ("Sathi Drug House",          "Sonadanga",      22.8634,   89.5501),
-    ("Health Plus Healthcare",      "Sonadanga",      22.8756,   89.5489),
-    ("Trust Healthcare",            "Daulatpur",      22.8923,   89.5234),
+    ("Health Plus Facility",      "Sonadanga",      22.8756,   89.5489),
+    ("Trust Facility",            "Daulatpur",      22.8923,   89.5234),
     ("Al-Shifa Medicine",         "Daulatpur",      22.8967,   89.5189),
     ("Moon Drug Store",           "Daulatpur",      22.8845,   89.5278),
-    ("Green Cross Healthcare",      "Daulatpur",      22.9012,   89.5145),
-    ("Rupali Healthcare",           "Khalishpur",     22.8234,   89.5089),
+    ("Green Cross Facility",      "Daulatpur",      22.9012,   89.5145),
+    ("Rupali Facility",           "Khalishpur",     22.8234,   89.5089),
     ("Akbar Medicine Corner",     "Khalishpur",     22.8189,   89.5123),
     ("Hasan Drug House",          "Khalishpur",     22.8267,   89.5056),
-    ("Mamun Healthcare",            "Khalishpur",     22.8145,   89.5167),
+    ("Mamun Facility",            "Khalishpur",     22.8145,   89.5167),
     ("Riya Medicine Store",       "Batiaghata",     22.7923,   89.4834),
-    ("Asha Healthcare",             "Batiaghata",     22.7867,   89.4789),
+    ("Asha Facility",             "Batiaghata",     22.7867,   89.4789),
     ("Life Care Drug House",      "Batiaghata",     22.7978,   89.4878),
 ]
 
 for i, (name, upazila, lat, lon) in enumerate(raw):
     HEALTHCARES.append({
-        "healthcare_id": f"PH{i:03d}",
+        "facility_id": f"PH{i:03d}",
         "name":        name,
         "upazila":     upazila,
         "lat":         round(lat + random.uniform(-0.003, 0.003), 6),
@@ -102,9 +102,9 @@ OUTBREAKS = [
 ]
 
 # ── 4. Helper — outbreak sales multiplier ─────────────────────────────────────
-def get_multiplier(healthcare, medicine_name, day):
+def get_multiplier(facility, medicine_name, day):
     for ob in OUTBREAKS:
-        if (healthcare["upazila"] in ob["upazilas"]
+        if (facility["upazila"] in ob["upazilas"]
                 and medicine_name in ob["medicines"]
                 and ob["start_day"] <= day <= ob["end_day"]):
             peak   = (ob["start_day"] + ob["end_day"]) // 2
@@ -132,7 +132,7 @@ for day in range(NUM_DAYS):
                 continue
             sales_rows.append({
                 "date":          date,
-                "healthcare_id":   ph["healthcare_id"],
+                "facility_id":   ph["facility_id"],
                 "medicine_name": med_name,
                 "quantity_sold": qty,
                 "upazila":       ph["upazila"],
@@ -140,21 +140,21 @@ for day in range(NUM_DAYS):
 
 # ── 6. Write all CSVs ─────────────────────────────────────────────────────────
 
-# healthcares.csv
-with open(f"{OUT}/healthcares.csv", "w", newline="") as f:
-    w = csv.DictWriter(f, fieldnames=["healthcare_id","name","upazila","lat","lon"])
+# facilities.csv
+with open(f"{OUT}/facilities.csv", "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=["facility_id","name","upazila","lat","lon"])
     w.writeheader()
     w.writerows(HEALTHCARES)
-print(f"✓ healthcares.csv        — {len(HEALTHCARES)} healthcares across 5 Khulna upazilas")
+print(f"✓ facilities.csv        — {len(HEALTHCARES)} facilities across 5 Khulna upazilas")
 
 # sales.csv
 with open(f"{OUT}/sales.csv", "w", newline="") as f:
-    w = csv.DictWriter(f, fieldnames=["date","healthcare_id","medicine_name",
+    w = csv.DictWriter(f, fieldnames=["date","facility_id","medicine_name",
                                        "quantity_sold","upazila"])
     w.writeheader()
     w.writerows(sales_rows)
 print(f"✓ sales.csv             — {len(sales_rows):,} records "
-      f"({NUM_DAYS} days × {len(HEALTHCARES)} healthcares × {len(MEDICINES)} medicines)")
+      f"({NUM_DAYS} days × {len(HEALTHCARES)} facilities × {len(MEDICINES)} medicines)")
 
 # medicines.csv
 with open(f"{OUT}/medicines.csv", "w", newline="") as f:
@@ -186,10 +186,12 @@ print()
 print("Dataset summary:")
 print(f"  District  : Khulna")
 print(f"  Upazilas  : Khulna Sadar, Sonadanga, Daulatpur, Khalishpur, Batiaghata")
-print(f"  Healthcares: {len(HEALTHCARES)}")
+print(f"  Facilities: {len(HEALTHCARES)}")
 print(f"  Days      : {NUM_DAYS} (Jan 1 – Mar 31, 2024)")
 print(f"  Records   : {len(sales_rows):,}")
 print()
 print("Compatible with:")
 print("  ✓ Your model      → ST-GNN outbreak prediction (run_all.py)")
 print("  ✓ Friend's model  → Prophet forecasting (forecast_hrsp.py)")
+
+

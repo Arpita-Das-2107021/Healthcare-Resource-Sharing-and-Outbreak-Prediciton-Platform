@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link, Navigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Loader2 } from 'lucide-react';
@@ -22,6 +22,7 @@ import { usePermission } from '@/hooks/usePermission';
 import { useToast } from '@/hooks/use-toast';
 import { inventoryApi, inventoryModuleApi } from '@/services/api';
 import { inventoryService, type InventoryItem } from '@/services/inventoryService';
+import { RESOURCE_SHARES_UPDATED_EVENT } from '@/constants/events';
 
 const INVENTORY_QUERY_KEY = ['retail-inventory'];
 
@@ -124,6 +125,24 @@ const InventoryPage = () => {
     queryFn: () => inventoryService.list(),
     enabled: canViewInventory,
   });
+
+  useEffect(() => {
+    if (!canViewInventory) {
+      return;
+    }
+
+    const refreshInventory = () => {
+      void queryClient.invalidateQueries({ queryKey: INVENTORY_QUERY_KEY });
+    };
+
+    window.addEventListener(RESOURCE_SHARES_UPDATED_EVENT, refreshInventory);
+    window.addEventListener('focus', refreshInventory);
+
+    return () => {
+      window.removeEventListener(RESOURCE_SHARES_UPDATED_EVENT, refreshInventory);
+      window.removeEventListener('focus', refreshInventory);
+    };
+  }, [canViewInventory, queryClient]);
 
   const inventoryItems = useMemo(() => inventoryQuery.data || [], [inventoryQuery.data]);
 

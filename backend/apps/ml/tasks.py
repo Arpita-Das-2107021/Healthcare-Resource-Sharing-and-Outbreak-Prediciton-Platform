@@ -29,7 +29,7 @@ from .dataset_pipeline import (
 )
 from .models import MLJob, MLJobEvent, MLSchedule, MLTrainingDatasetSnapshot, MLTrainingJob
 from .scheduling import compute_next_run_at, evaluate_schedule, resolve_timezone_for_facility
-from .training_services import get_active_model_version_name
+from .training_services import get_active_model_version_name  # noqa: F401
 
 logger = logging.getLogger("hrsp.ml")
 
@@ -379,9 +379,9 @@ def _dispatch_url_for_model(model_key: str) -> str:
         raise RuntimeError("ML_SERVER_B_BASE_URL is not configured.")
 
     if model_key == "model1":
-        path = str(getattr(settings, "ML_SERVER_B_MODEL1_PREDICT_PATH", "/api/v1/ml/model1/predict"))
+        path = str(getattr(settings, "ML_SERVER_B_MODEL1_PREDICT_PATH", "/api/v1/inference/model1/predict"))
     elif model_key == "model2":
-        path = str(getattr(settings, "ML_SERVER_B_MODEL2_PREDICT_PATH", "/api/v1/ml/model2/predict"))
+        path = str(getattr(settings, "ML_SERVER_B_MODEL2_PREDICT_PATH", "/api/v1/inference/model2/predict"))
     else:
         raise RuntimeError(f"Unsupported JSON inference model key: {model_key}")
 
@@ -454,39 +454,26 @@ def queue_ml_job_execution(job_id: str) -> None:
         process_ml_job_pipeline_task.delay(str(job.id))
 
 
-def _job_context_payload(job: MLJob) -> dict:
-    facility_id = str(job.facility_id) if job.facility_id else ""
-    catalog_ids = [
-        str(pk)
-        for pk in ResourceCatalog.objects.filter(hospital_id=job.facility_id)
-        .order_by("name")
-        .values_list("id", flat=True)[:25]
-    ]
-    neighbors = [
-        str(pk)
-        for pk in Hospital.objects.exclude(id=job.facility_id)
-        .exclude(verified_status=Hospital.VerifiedStatus.OFFBOARDED)
-        .order_by("name")
-        .values_list("id", flat=True)[:25]
-    ]
-    context = {
-        "facility_id": facility_id,
-        "resource_catalog_ids": catalog_ids,
-        "neighbor_facility_ids": neighbors,
+def _require_minio_uri(value: str, field_name: str) -> str:
+    uri = str(value or "").strip()
+    if not uri.startswith("minio://"):
+        raise RuntimeError(f"{field_name} must start with minio://")
+    return uri
+
+
+def _require_callback_payload() -> dict:
+    callback_url = str(getattr(settings, "ML_SERVER_A_CALLBACK_URL", "") or "").strip()
+    if not callback_url:
+        raise RuntimeError("ML_SERVER_A_CALLBACK_URL is required for Server B dispatch.")
+
+    timeout_seconds = int(getattr(settings, "ML_SERVER_B_CALLBACK_TIMEOUT_SECONDS", 10))
+    if timeout_seconds <= 0:
+        raise RuntimeError("ML_SERVER_B_CALLBACK_TIMEOUT_SECONDS must be greater than 0.")
+
+    return {
+        "url": callback_url,
+        "timeout_seconds": timeout_seconds,
     }
-
-    parameters = job.parameters if isinstance(job.parameters, dict) else {}
-    schedule_meta = parameters.get("_schedule_meta") if isinstance(parameters.get("_schedule_meta"), dict) else None
-    if schedule_meta:
-        context["schedule"] = {
-            "schedule_id": schedule_meta.get("schedule_id"),
-            "run_time_local": schedule_meta.get("run_time_local"),
-            "scheduled_time_local": schedule_meta.get("scheduled_time_local"),
-            "scheduled_time_utc": schedule_meta.get("scheduled_time_utc"),
-            "timezone": schedule_meta.get("timezone"),
-        }
-
-    return context
 
 
 def _build_server_b_payload(job: MLJob, dataset_manifest: dict) -> dict:
@@ -495,34 +482,37 @@ def _build_server_b_payload(job: MLJob, dataset_manifest: dict) -> dict:
 
     input_payload = {
         "snapshot_id": str(job.id),
-        "sales_file_path": files[SALES_FILE_NAME]["uri"],
-        "medicines_file_path": files[MEDICINES_FILE_NAME]["uri"],
-        "healthcares_file_path": files[HEALTHCARES_FILE_NAME]["uri"],
-        # Keep alias for existing consumers that still use facilities_file_path naming.
-        "facilities_file_path": files[HEALTHCARES_FILE_NAME]["uri"],
+        "sales_file_path": _require_minio_uri(files[SALES_FILE_NAME]["uri"], "input.sales_file_path"),
+        "facilities_file_path": _require_minio_uri(files[HEALTHCARES_FILE_NAME]["uri"], "input.facilities_file_path"),
     }
+    if job.job_type == MLJob.JobType.FORECAST:
+        input_payload["medicines_file_path"] = _require_minio_uri(
+            files[MEDICINES_FILE_NAME]["uri"],
+            "input.medicines_file_path",
+        )
 
     ground_truth_uri = (dataset_manifest.get("outbreaks_ground_truth") or {}).get("uri")
     if ground_truth_uri:
-        input_payload["outbreaks_ground_truth_file_path"] = ground_truth_uri
+        input_payload["outbreaks_ground_truth_file_path"] = _require_minio_uri(
+            ground_truth_uri,
+            "input.outbreaks_ground_truth_file_path",
+        )
+
+    resolved_model_version = (job.model_version or "").strip()
+    if not resolved_model_version:
+        model_key = _model_key_for_job_type(job.job_type)
+        resolved_model_version = _resolve_server_b_model_version(model_key)
 
     payload = {
         "job_id": str(job.id),
         "prediction_horizon_days": horizon,
         "input": input_payload,
-        "model_version": job.model_version or "",
-        "context": _job_context_payload(job),
+        "model_version": resolved_model_version,
+        "callback": _require_callback_payload(),
     }
 
     if job.job_type == MLJob.JobType.OUTBREAK:
         payload["max_neighbors"] = int(job.parameters.get("max_neighbors", 20) or 20)
-
-    callback_url = str(getattr(settings, "ML_SERVER_A_CALLBACK_URL", "") or "").strip()
-    if callback_url:
-        payload["callback"] = {
-            "url": callback_url,
-            "timeout_seconds": int(getattr(settings, "ML_SERVER_B_CALLBACK_TIMEOUT_SECONDS", 10)),
-        }
 
     return payload
 
@@ -530,13 +520,13 @@ def _build_server_b_payload(job: MLJob, dataset_manifest: dict) -> dict:
 def _resolve_server_b_model_version(model_key: str) -> str:
     base_url = str(getattr(settings, "ML_SERVER_B_BASE_URL", "") or "").strip().rstrip("/")
     if not base_url:
-        return ""
+        raise RuntimeError("ML_SERVER_B_BASE_URL is not configured.")
 
     path_template = str(
         getattr(settings, "ML_SERVER_B_MODEL_VERSIONS_PATH_TEMPLATE", "/api/v1/models/{model_type}/versions") or ""
     ).strip()
     if not path_template:
-        return ""
+        raise RuntimeError("ML_SERVER_B_MODEL_VERSIONS_PATH_TEMPLATE is not configured.")
 
     try:
         path = path_template.format(model_type=model_key)
@@ -552,45 +542,15 @@ def _resolve_server_b_model_version(model_key: str) -> str:
         response.raise_for_status()
         payload = response.json() if response.content else {}
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Unable to resolve Server B model version for %s from %s: %s", model_key, url, exc)
-        return ""
+        raise RuntimeError(f"Unable to resolve Server B model version for {model_key} from {url}: {exc}")
 
     if not isinstance(payload, dict):
-        return ""
+        raise RuntimeError(f"Invalid model versions response for {model_key}: expected object.")
 
     active_version = str(payload.get("active_version") or "").strip()
     if active_version:
         return active_version
-
-    versions = payload.get("versions") if isinstance(payload.get("versions"), list) else []
-    fallback_version = ""
-    for entry in versions:
-        if not isinstance(entry, dict):
-            continue
-
-        version_name = str(entry.get("version") or "").strip()
-        if not version_name:
-            continue
-
-        status = str(entry.get("status") or "").strip().lower()
-        approval_status = str(entry.get("approval_status") or "").strip().lower()
-
-        if status == "active":
-            return version_name
-        if not fallback_version and status in {"trained", "ready", "deployed"}:
-            fallback_version = version_name
-        if not fallback_version and approval_status in {"approved", "pending_approval"}:
-            fallback_version = version_name
-
-    return fallback_version
-
-
-def _default_model_version_for_key(model_key: str) -> str:
-    if model_key == "model1":
-        return str(getattr(settings, "ML_SERVER_B_MODEL1_DEFAULT_VERSION", "") or "").strip()
-    if model_key == "model2":
-        return str(getattr(settings, "ML_SERVER_B_MODEL2_DEFAULT_VERSION", "") or "").strip()
-    return ""
+    raise RuntimeError(f"No active model version found for {model_key} at {url}.")
 
 
 def _normalize_schedule_execution_mode(raw_mode: str | None) -> str:
@@ -719,30 +679,42 @@ def _build_json_inference_payload(job: MLJob) -> dict:
 
     resolved_model_version = (job.model_version or "").strip()
     if not resolved_model_version:
-        resolved_model_version = get_active_model_version_name(model_key)
-    if not resolved_model_version:
         resolved_model_version = _resolve_server_b_model_version(model_key)
-    if not resolved_model_version:
-        resolved_model_version = _default_model_version_for_key(model_key)
 
     payload = {
         "job_id": str(job.id),
         "prediction_horizon_days": int(parameters.get("prediction_horizon_days", 1) or 1),
         "input": inference_input,
+        "model_version": resolved_model_version,
+        "callback": _require_callback_payload(),
     }
-
-    if resolved_model_version:
-        payload["model_version"] = resolved_model_version
 
     if model_key == "model2":
         payload["max_neighbors"] = int(parameters.get("max_neighbors", 20) or 20)
 
-    callback_url = str(getattr(settings, "ML_SERVER_A_CALLBACK_URL", "") or "").strip()
-    if callback_url:
-        payload["callback"] = {
-            "url": callback_url,
-            "timeout_seconds": int(getattr(settings, "ML_SERVER_B_CALLBACK_TIMEOUT_SECONDS", 10)),
-        }
+    if not isinstance(inference_input.get("rows"), list) or not inference_input.get("rows"):
+        raise RuntimeError("JSON inference payload requires input.rows with at least one row.")
+
+    if model_key == "model1":
+        for index, row in enumerate(inference_input["rows"]):
+            if not isinstance(row, dict):
+                raise RuntimeError(f"model1 input.rows[{index}] must be an object.")
+            if not row.get("facility_id"):
+                raise RuntimeError(f"model1 input.rows[{index}].facility_id is required.")
+            if not row.get("resource_catalog_id"):
+                raise RuntimeError(f"model1 input.rows[{index}].resource_catalog_id is required.")
+
+    if model_key == "model2":
+        for index, row in enumerate(inference_input["rows"]):
+            if not isinstance(row, dict):
+                raise RuntimeError(f"model2 input.rows[{index}] must be an object.")
+            if not row.get("facility_id"):
+                raise RuntimeError(f"model2 input.rows[{index}].facility_id is required.")
+
+        neighbors = inference_input.get("neighbors", {})
+        if neighbors is not None and not isinstance(neighbors, dict):
+            raise RuntimeError("model2 input.neighbors must be an object when provided.")
+
     return payload
 
 

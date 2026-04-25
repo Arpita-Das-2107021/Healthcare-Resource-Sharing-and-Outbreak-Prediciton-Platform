@@ -150,7 +150,7 @@ class ModelRegistryService:
         if not self.model2_default_artifact:
             return False
 
-        version = "outbreak-default-v1"
+        version = "outbreak-stgnn-v2"
         now = self._utc_now()
         model_state["versions"].append(
             {

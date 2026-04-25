@@ -23,10 +23,14 @@ class OutbreakAcceptedResponse(BaseModel):
 
 
 class OutbreakResultItem(BaseModel):
-    healthcare_id: str
+    facility_id: str
     upazila: str
-    outbreak_probability: float = Field(..., ge=0.0, le=1.0)
-    outbreak_flag: bool
+    model_prob: float = Field(..., ge=0.0, le=1.0)
+    social_score: float = Field(..., ge=0.0, le=1.0)
+    final_confidence: float = Field(..., ge=0.0, le=1.0)
+    status: str
+    likely_disease: str
+    social_confirmation: str
 
 
 class CallbackPayload(BaseModel):
@@ -57,7 +61,7 @@ class V1OutbreakJobRequest(BaseModel):
     job_id: UUID
     prediction_horizon_days: int = Field(..., gt=0)
     input: V1OutbreakInput
-    model_version: str = Field(default="outbreak-v1")
+    model_version: str = Field(default="outbreak-stgnn-v2")
     max_neighbors: int = Field(default=20, gt=0)
     callback: V1CallbackConfig
 
@@ -72,12 +76,20 @@ class V1AcceptedResponse(BaseModel):
 
 class V1OutbreakResultItem(BaseModel):
     facility_id: str
-    outbreak_probability: float = Field(..., ge=0.0, le=1.0)
-    outbreak_flag: bool
+    upazila: str
+    model_prob: float = Field(..., ge=0.0, le=1.0)
+    social_score: float = Field(..., ge=0.0, le=1.0)
+    final_confidence: float = Field(..., ge=0.0, le=1.0)
+    status: str
+    likely_disease: str
+    social_confirmation: str
+    outbreak_probability: float = Field(default=0.0, ge=0.0, le=1.0)
+    outbreak_flag: bool = False
 
 
 class V1NeighborItem(BaseModel):
     facility_id: str
+    upazila: str = ""
     distance_km: float = Field(..., ge=0.0)
 
 
