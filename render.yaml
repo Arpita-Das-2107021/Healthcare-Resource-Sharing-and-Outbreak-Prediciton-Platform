@@ -1,5 +1,6 @@
 services:
   - type: web
+    runtime: static
     name: hrsp-frontend-free
     # plan: free
     rootDir: frontend/frontend
