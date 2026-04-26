@@ -1,18 +1,8 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import AppLayout from '@/components/layout/AppLayout';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Label } from '@/components/ui/label';
-import { Input } from '@/components/ui/input';
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
-import { Switch } from '@/components/ui/switch';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import {
   Table,
@@ -34,29 +24,24 @@ import {
 import { mlApi } from '@/services/api';
 import { useAuth } from '@/contexts/AuthContext';
 import { useToast } from '@/hooks/use-toast';
-import { hasAnyPermission, hasHospitalRole } from '@/lib/rbac';
-import { AlertTriangle, Loader2, RefreshCcw, TrendingUp } from 'lucide-react';
-
-type FrequencyOption = 'hourly' | 'daily' | 'weekly';
+import { AlertTriangle, CheckCircle2, Loader2, RefreshCcw, TrendingUp } from 'lucide-react';
 
 interface ForecastRow {
   key: string;
-  label: string;
-  itemName: string;
-  predicted: number;
-  lowerBound: number;
-  upperBound: number;
-  actual: number;
-  riskLevel: string;
-  recommendation: string;
+  resourceCatalogId: string;
+  predictionHorizonDays: number;
+  predictedDemand: number;
+  shareableQuantity: number;
+  restock: boolean;
+  restockAmount: number;
+  explanation: string;
+  confidenceScore: number;
 }
 
-interface FacilitySchedule {
-  id: string;
-  frequency: FrequencyOption;
-  runTime: string;
-  active: boolean;
-}
+type JobStatus = 'completed' | 'processing' | 'failed' | 'not_available' | null;
+
+const POLL_INTERVAL_MS = 5_000;
+const MAX_POLL_ATTEMPTS = 24; // 2 minutes max
 
 const asRecord = (value: unknown): Record<string, unknown> => {
   if (value && typeof value === 'object' && !Array.isArray(value)) {
@@ -72,161 +57,40 @@ const toNumber = (value: unknown): number => {
   return Number.isFinite(parsed) ? parsed : 0;
 };
 
-const toFrequency = (value: unknown): FrequencyOption => {
-  const normalized = String(value || '').toLowerCase();
-  if (normalized === 'hourly' || normalized === 'weekly') {
-    return normalized;
-  }
-  return 'daily';
-};
-
-const toTime = (value: unknown): string => {
-  const text = String(value || '').trim();
-  if (!text) return '02:00';
-
-  const hhmmMatch = text.match(/^(\d{2}:\d{2})/);
-  if (hhmmMatch?.[1]) {
-    return hhmmMatch[1];
-  }
-
-  return '02:00';
-};
-
-const normalizeRiskLabel = (value: unknown): string => {
-  const normalized = String(value || '').trim().toLowerCase();
-  if (!normalized) return 'unknown';
-  return normalized;
-};
-
-const pickArray = (root: Record<string, unknown>, data: Record<string, unknown>, nested: Record<string, unknown>): unknown[] => {
-  const candidates = [
-    data.items,
-    data.results,
-    data.rows,
-    data.forecast_rows,
-    data.forecasts,
-    nested.items,
-    nested.results,
-    nested.rows,
-    nested.forecast_rows,
-    nested.forecasts,
-    root.items,
-    root.results,
-    root.rows,
-    root.forecast_rows,
-    root.forecasts,
-  ];
-
-  for (const candidate of candidates) {
-    const parsed = asArray(candidate);
-    if (parsed.length > 0) {
-      return parsed;
-    }
-  }
-
-  return [];
-};
-
-const extractForecastRows = (payload: unknown): ForecastRow[] => {
+const extractForecastData = (
+  payload: unknown,
+): {
+  status: JobStatus;
+  isStale: boolean;
+  hasPartialFailures: boolean;
+  completedAt: string;
+  rows: ForecastRow[];
+} => {
   const root = asRecord(payload);
   const data = asRecord(root.data);
-  const nested = asRecord(data.result);
+  const status = (data.status as JobStatus) ?? null;
+  const isStale = Boolean(data.is_stale);
+  const hasPartialFailures = Boolean(data.has_partial_failures);
+  const completedAt = String(data.completed_at ?? '');
+  const items = asArray(data.items);
 
-  const list = pickArray(root, data, nested);
+  const rows: ForecastRow[] = items.map((item, index) => {
+    const row = asRecord(item);
+    const resourceCatalogId = String(row.resource_catalog_id ?? `item-${index}`).trim();
+    return {
+      key: `${resourceCatalogId}-${index}`,
+      resourceCatalogId,
+      predictionHorizonDays: toNumber(row.prediction_horizon_days ?? 7),
+      predictedDemand: toNumber(row.predicted_demand),
+      shareableQuantity: toNumber(row.shareable_quantity),
+      restock: Boolean(row.restock),
+      restockAmount: toNumber(row.restock_amount),
+      explanation: String(row.explanation ?? '').trim(),
+      confidenceScore: toNumber(row.confidence_score),
+    };
+  });
 
-  return list
-    .map((item, index) => {
-      const row = asRecord(item);
-      const itemName = String(
-        row.item_name ??
-          row.catalog_item_name ??
-          row.resource_name ??
-          row.resource_catalog_id ??
-          row.catalog_item_id ??
-          row.name ??
-          row.item ??
-          'Item'
-      ).trim();
-      const label = String(
-        row.period ?? row.month ?? row.week ?? row.date ?? row.bucket ?? `Point ${index + 1}`
-      ).trim();
-
-      const predicted = toNumber(
-        row.predicted_demand ?? row.predicted ?? row.forecast_quantity ?? row.forecast ?? row.value
-      );
-      const lowerBound = toNumber(row.lower_bound ?? row.lowerBound ?? row.lower ?? row.min ?? predicted);
-      const upperBound = toNumber(row.upper_bound ?? row.upperBound ?? row.upper ?? row.max ?? predicted);
-      const actual = toNumber(row.actual_demand ?? row.actual ?? row.current_usage ?? row.observed ?? 0);
-      const riskLevel = normalizeRiskLabel(
-        row.risk_level ?? row.stockout_risk ?? row.severity ?? row.alert_level ?? ''
-      );
-      const recommendation = String(
-        row.recommended_action ?? row.recommendation ?? row.action ?? row.guidance ?? ''
-      ).trim();
-
-      return {
-        key: `${itemName}-${label}-${index}`,
-        label: label || `Point ${index + 1}`,
-        itemName: itemName || `Item ${index + 1}`,
-        predicted,
-        lowerBound,
-        upperBound,
-        actual,
-        riskLevel,
-        recommendation,
-      };
-    })
-    .filter((row) => row.label && (row.predicted > 0 || row.actual > 0 || row.upperBound > 0));
-};
-
-const extractGeneratedAt = (payload: unknown): string => {
-  const root = asRecord(payload);
-  const data = asRecord(root.data);
-  const nested = asRecord(data.result);
-
-  return String(
-    data.completed_at ??
-    data.generated_at ??
-      data.created_at ??
-      data.updated_at ??
-      nested.completed_at ??
-      nested.generated_at ??
-      nested.created_at ??
-      root.completed_at ??
-      root.generated_at ??
-      root.created_at ??
-      ''
-  );
-};
-
-const extractForecastSchedule = (payload: unknown, facilityId: string): FacilitySchedule | null => {
-  const root = asRecord(payload);
-  const data = asRecord(root.data);
-  const list = asArray(data.results ?? root.results ?? data.items ?? root.items ?? payload);
-
-  const matched = list
-    .map((item) => asRecord(item))
-    .find((item) => {
-      const scheduleFacilityId = String(item.facility_id ?? item.facility ?? '').trim();
-      const jobType = String(item.job_type ?? item.type ?? '').toLowerCase();
-      return scheduleFacilityId === facilityId && jobType === 'forecast';
-    });
-
-  if (!matched) return null;
-
-  return {
-    id: String(matched.id ?? matched.schedule_id ?? '').trim(),
-    frequency: toFrequency(matched.frequency),
-    runTime: toTime(matched.run_time ?? matched.time),
-    active: Boolean(matched.active ?? matched.is_active ?? true),
-  };
-};
-
-const riskVariant = (riskLevel: string): 'default' | 'secondary' | 'destructive' | 'outline' => {
-  if (riskLevel.includes('critical') || riskLevel.includes('high')) return 'destructive';
-  if (riskLevel.includes('medium') || riskLevel.includes('warning')) return 'secondary';
-  if (riskLevel.includes('low')) return 'default';
-  return 'outline';
+  return { status, isStale, hasPartialFailures, completedAt, rows };
 };
 
 const formatDateTime = (value: string): string => {
@@ -242,172 +106,177 @@ const MLForecastingPage = () => {
 
   const facilityId = user?.hospital_id || '';
   const facilityName = user?.hospital_name || 'Your facility';
-  const canConfigureSchedule =
-    hasAnyPermission(user, ['ml:schedule.manage', 'ml:facility.settings.manage']) ||
-    hasHospitalRole(user, ['HOSPITAL_ADMIN', 'HEALTHCARE_ADMIN']);
 
   const [loading, setLoading] = useState(false);
-  const [savingSchedule, setSavingSchedule] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
 
   const [rows, setRows] = useState<ForecastRow[]>([]);
-  const [lastUpdatedAt, setLastUpdatedAt] = useState('');
-  const [partialFailure, setPartialFailure] = useState(false);
+  const [completedAt, setCompletedAt] = useState('');
+  const [isStale, setIsStale] = useState(false);
+  const [hasPartialFailures, setHasPartialFailures] = useState(false);
+  const [jobStatus, setJobStatus] = useState<JobStatus>(null);
 
-  const [schedule, setSchedule] = useState<FacilitySchedule | null>(null);
-  const [frequency, setFrequency] = useState<FrequencyOption>('daily');
-  const [runTime, setRunTime] = useState('02:00');
-  const [autoRefresh, setAutoRefresh] = useState(true);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollCountRef = useRef(0);
+  const inFlightRef = useRef(false);
 
   const totalPredicted = useMemo(
-    () => rows.reduce((sum, row) => sum + row.predicted, 0),
-    [rows]
+    () => rows.reduce((sum, row) => sum + row.predictedDemand, 0),
+    [rows],
   );
 
-  const highRiskItems = useMemo(
-    () => rows.filter((row) => row.riskLevel.includes('high') || row.riskLevel.includes('critical')).length,
-    [rows]
-  );
+  const restockCount = useMemo(() => rows.filter((row) => row.restock).length, [rows]);
 
-  const avgForecastBand = useMemo(() => {
+  const avgConfidence = useMemo(() => {
     if (rows.length === 0) return 0;
-    const totalBand = rows.reduce((sum, row) => sum + Math.max(0, row.upperBound - row.lowerBound), 0);
-    return Math.round(totalBand / rows.length);
+    const total = rows.reduce((sum, row) => sum + row.confidenceScore, 0);
+    return Math.round((total / rows.length) * 100);
   }, [rows]);
+
+  const stopPolling = () => {
+    if (pollRef.current !== null) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+    pollCountRef.current = 0;
+    inFlightRef.current = false;
+  };
+
+  const applyForecastPayload = (payload: unknown): JobStatus => {
+    const {
+      status,
+      isStale: stale,
+      hasPartialFailures: partial,
+      completedAt: at,
+      rows: extracted,
+    } = extractForecastData(payload);
+    setJobStatus(status);
+    setIsStale(stale);
+    setHasPartialFailures(partial);
+    setCompletedAt(at);
+    setRows(extracted);
+    return status;
+  };
+
+  const startPolling = (id: string) => {
+    stopPolling();
+    pollRef.current = setInterval(async () => {
+      if (inFlightRef.current) return;
+      pollCountRef.current += 1;
+      if (pollCountRef.current >= MAX_POLL_ATTEMPTS) {
+        stopPolling();
+        return;
+      }
+      inFlightRef.current = true;
+      try {
+        const result = await mlApi.getLatestForecast(id);
+        const status = applyForecastPayload(result);
+        if (status !== 'processing') {
+          stopPolling();
+          if (status === 'completed') {
+            toast({
+              title: 'Forecast updated',
+              description: 'Latest predictions are now available.',
+            });
+          }
+        }
+      } catch {
+        // silent — user sees results when the next successful poll lands
+      } finally {
+        inFlightRef.current = false;
+      }
+    }, POLL_INTERVAL_MS);
+  };
 
   const loadPageData = async () => {
     if (!facilityId) return;
+    stopPolling();
 
     try {
       setLoading(true);
-      setPartialFailure(false);
 
-      const [forecastResult, schedulesResult] = await Promise.allSettled([
-        mlApi.getLatestForecast(facilityId),
-        mlApi.listSchedules(),
-      ]);
-
-      if (forecastResult.status === 'fulfilled') {
-        const parsedRows = extractForecastRows(forecastResult.value);
-        setRows(parsedRows);
-        setLastUpdatedAt(extractGeneratedAt(forecastResult.value));
-      } else {
-        setRows([]);
-      }
-
-      if (schedulesResult.status === 'fulfilled') {
-        const matchedSchedule = extractForecastSchedule(schedulesResult.value, facilityId);
-        setSchedule(matchedSchedule);
-        if (matchedSchedule) {
-          setFrequency(matchedSchedule.frequency);
-          setRunTime(matchedSchedule.runTime);
-          setAutoRefresh(matchedSchedule.active);
-        } else {
-          setFrequency('daily');
-          setRunTime('02:00');
-          setAutoRefresh(true);
-        }
-      }
-
-      const hasFailure = [forecastResult, schedulesResult].some((result) => result.status === 'rejected');
-      setPartialFailure(hasFailure);
-
-      if (hasFailure) {
-        toast({
-          title: 'Some data could not be loaded',
-          description: 'We are showing the forecast details that are currently available.',
-          variant: 'destructive',
-        });
-      }
+      const result = await mlApi.getLatestForecast(facilityId);
+      applyForecastPayload(result);
     } catch (error) {
       toast({
-        title: 'Unable to load forecast details',
+        title: 'Unable to load forecast',
         description: error instanceof Error ? error.message : 'Please try again in a moment.',
         variant: 'destructive',
       });
+      setRows([]);
     } finally {
       setLoading(false);
     }
   };
 
-  useEffect(() => {
-    void loadPageData();
-  }, [facilityId]);
-
-  const saveSchedule = async () => {
+  const triggerRefresh = async () => {
     if (!facilityId) return;
-    if (!canConfigureSchedule) {
-      toast({
-        title: 'Permission required',
-        description: 'You need ML schedule permissions to update forecast refresh preferences.',
-        variant: 'destructive',
-      });
-      return;
-    }
-
-    if (frequency !== 'hourly' && !runTime) {
-      toast({
-        title: 'Refresh time required',
-        description: 'Choose a time for daily or weekly refresh.',
-        variant: 'destructive',
-      });
-      return;
-    }
 
     try {
-      setSavingSchedule(true);
+      setRefreshing(true);
 
-      if (schedule?.id) {
-        await mlApi.updateSchedule(schedule.id, {
-          frequency,
-          run_time: frequency === 'hourly' ? undefined : runTime,
-        });
+      const result = await mlApi.refresh(facilityId, {
+        job_type: 'forecast',
+        prediction_horizon_days: 7,
+      });
+      const root = asRecord(result);
 
-        if (schedule.active !== autoRefresh) {
-          if (autoRefresh) {
-            await mlApi.activateSchedule(schedule.id);
-          } else {
-            await mlApi.deactivateSchedule(schedule.id);
-          }
+      if (root.success === false) {
+        const errorObj = asRecord(root.error);
+        if (String(errorObj.code) === 'active_job_exists') {
+          toast({
+            title: 'Already updating',
+            description: 'A forecast update is already running. Results will appear automatically.',
+          });
+          setJobStatus('processing');
+          startPolling(facilityId);
+        } else {
+          toast({
+            title: 'Refresh failed',
+            description: String(errorObj.message || 'Please try again later.'),
+            variant: 'destructive',
+          });
         }
-      } else {
-        await mlApi.createSchedule({
-          job_type: 'forecast',
-          facility_id: facilityId,
-          frequency,
-          run_time: frequency === 'hourly' ? undefined : runTime,
-          active: autoRefresh,
-          is_active: autoRefresh,
-        });
+        return;
       }
 
       toast({
-        title: 'Forecast refresh preferences saved',
-        description: 'Your prediction update schedule has been updated.',
+        title: 'Forecast update triggered',
+        description: 'New predictions are being computed. This page will refresh automatically.',
       });
-
-      await loadPageData();
+      setJobStatus('processing');
+      startPolling(facilityId);
     } catch (error) {
       toast({
-        title: 'Unable to save schedule',
+        title: 'Refresh failed',
         description: error instanceof Error ? error.message : 'Please try again later.',
         variant: 'destructive',
       });
     } finally {
-      setSavingSchedule(false);
+      setRefreshing(false);
     }
   };
 
+  useEffect(() => {
+    void loadPageData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [facilityId]);
+
+  useEffect(() => {
+    return () => {
+      if (pollRef.current !== null) clearInterval(pollRef.current);
+    };
+  }, []);
+
   if (!facilityId) {
     return (
-      <AppLayout
-        title="Forecasting"
-        // subtitle="Demand projections for your facility"
-      >
+      <AppLayout title="Forecasting">
         <Alert variant="destructive">
           <AlertTriangle className="h-4 w-4" />
           <AlertTitle>Facility context missing</AlertTitle>
           <AlertDescription>
-            We could not detect your facility from the current account. Contact your administrator to continue.
+            We could not detect your facility from the current account. Contact your administrator to
+            continue.
           </AlertDescription>
         </Alert>
       </AppLayout>
@@ -415,96 +284,53 @@ const MLForecastingPage = () => {
   }
 
   return (
-    <AppLayout
-      title="Forecasting"
-      // subtitle="Plan stock earlier with demand predictions tailored to your facility"
-    >
+    <AppLayout title="Forecasting">
       <div className="space-y-6">
+        {isStale && (
+          <Alert>
+            <AlertTriangle className="h-4 w-4" />
+            <AlertTitle>Results may be outdated</AlertTitle>
+            <AlertDescription>
+              The forecast data is more than 24 hours old. Trigger an update to get the latest
+              predictions.
+            </AlertDescription>
+          </Alert>
+        )}
+
         <Card>
           <CardHeader>
             <CardTitle className="text-base">{facilityName}</CardTitle>
-            {/* <CardTitle className="text-base">Facility Context</CardTitle>
-            <CardDescription>
-              Forecasting is automatically linked to your assigned facility.
-            </CardDescription> */}
           </CardHeader>
           <CardContent className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-            <div className="space-y-1">
-              {/* <p className="text-sm font-medium">{facilityName}</p>
-              <p className="font-mono text-xs text-muted-foreground">{facilityId}</p> */}
+            <div className="flex flex-wrap items-center gap-2">
               <p className="text-xs text-muted-foreground">
-                Last updated: {formatDateTime(lastUpdatedAt)}
+                Last updated: {formatDateTime(completedAt)}
               </p>
+              {isStale && <Badge variant="secondary">Stale</Badge>}
+              {hasPartialFailures && <Badge variant="destructive">Partial data</Badge>}
+              {jobStatus === 'processing' && (
+                <Badge variant="outline" className="gap-1">
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                  Updating…
+                </Badge>
+              )}
             </div>
             <div className="flex items-center gap-2">
-              {partialFailure ? <Badge variant="destructive">Partial data</Badge> : null}
               <Button variant="outline" onClick={loadPageData} disabled={loading}>
-                {loading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCcw className="mr-2 h-4 w-4" />}
-                Refresh Data
+                {loading ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <RefreshCcw className="mr-2 h-4 w-4" />
+                )}
+                Refresh
               </Button>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">Forecast Refresh Preferences</CardTitle>
-            <CardDescription>
-              Choose how often this page receives updated predictions.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="grid gap-4 md:grid-cols-3">
-              <div className="space-y-2">
-                <Label>Update Frequency</Label>
-                <Select value={frequency} onValueChange={(value) => setFrequency(value as FrequencyOption)}>
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="hourly">Every hour</SelectItem>
-                    <SelectItem value="daily">Every day</SelectItem>
-                    <SelectItem value="weekly">Every week</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-
-              <div className="space-y-2">
-                <Label htmlFor="forecast-run-time">Forecast Refresh Time</Label>
-                <Input
-                  id="forecast-run-time"
-                  type="time"
-                  value={runTime}
-                  onChange={(event) => setRunTime(event.target.value)}
-                  disabled={frequency === 'hourly'}
-                />
-              </div>
-
-              <div className="space-y-2">
-                <Label>Automatic Updates</Label>
-                <div className="flex h-10 items-center rounded-md border px-3">
-                  <Switch
-                    checked={autoRefresh}
-                    onCheckedChange={setAutoRefresh}
-                    disabled={!canConfigureSchedule}
-                  />
-                  <span className="ml-3 text-sm text-muted-foreground">
-                    {autoRefresh ? 'Enabled' : 'Paused'}
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            {!canConfigureSchedule ? (
-              <p className="text-xs text-muted-foreground">
-                You need ML schedule permissions to change these preferences.
-              </p>
-            ) : null}
-
-            <div>
-              <Button onClick={saveSchedule} disabled={savingSchedule || !canConfigureSchedule}>
-                {savingSchedule ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-                Save Preferences
+              <Button onClick={triggerRefresh} disabled={refreshing || jobStatus === 'processing'}>
+                {refreshing ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <TrendingUp className="mr-2 h-4 w-4" />
+                )}
+                {jobStatus === 'processing' ? 'Updating…' : 'Trigger Update'}
               </Button>
             </div>
           </CardContent>
@@ -529,8 +355,8 @@ const MLForecastingPage = () => {
                 <AlertTriangle className="h-5 w-5 text-amber-500" />
               </div>
               <div>
-                <p className="text-2xl font-semibold">{highRiskItems}</p>
-                <p className="text-xs text-muted-foreground">High-risk items</p>
+                <p className="text-2xl font-semibold">{restockCount}</p>
+                <p className="text-xs text-muted-foreground">Items needing restock</p>
               </div>
             </CardContent>
           </Card>
@@ -538,11 +364,11 @@ const MLForecastingPage = () => {
           <Card>
             <CardContent className="flex items-center gap-3 p-6">
               <div className="rounded-lg bg-sky-500/10 p-3">
-                <RefreshCcw className="h-5 w-5 text-sky-600" />
+                <CheckCircle2 className="h-5 w-5 text-sky-600" />
               </div>
               <div>
-                <p className="text-2xl font-semibold">{avgForecastBand}</p>
-                <p className="text-xs text-muted-foreground">Average uncertainty band</p>
+                <p className="text-2xl font-semibold">{avgConfidence}%</p>
+                <p className="text-xs text-muted-foreground">Average confidence</p>
               </div>
             </CardContent>
           </Card>
@@ -550,9 +376,9 @@ const MLForecastingPage = () => {
 
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Demand Trend</CardTitle>
+            <CardTitle className="text-base">Demand Forecast</CardTitle>
             <CardDescription>
-              Predicted demand with confidence range for upcoming periods.
+              Predicted demand and shareable quantities for the upcoming period.
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -561,15 +387,19 @@ const MLForecastingPage = () => {
                 <Loader2 className="h-8 w-8 animate-spin text-primary" />
               </div>
             ) : rows.length === 0 ? (
-              <p className="text-sm text-muted-foreground">
-                No forecast rows are available yet. Predictions will appear here after your next refresh cycle.
-              </p>
+              <div className="flex h-[320px] items-center justify-center">
+                <p className="text-sm text-muted-foreground">
+                  {jobStatus === 'processing'
+                    ? 'Predictions are being computed…'
+                    : 'No forecast data available. Trigger an update to generate predictions.'}
+                </p>
+              </div>
             ) : (
               <div className="h-[320px]">
                 <ResponsiveContainer width="100%" height="100%">
                   <AreaChart data={rows.slice(0, 18)}>
                     <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
-                    <XAxis dataKey="label" />
+                    <XAxis dataKey="resourceCatalogId" tick={{ fontSize: 10 }} />
                     <YAxis />
                     <Tooltip
                       contentStyle={{
@@ -578,10 +408,23 @@ const MLForecastingPage = () => {
                         borderRadius: '8px',
                       }}
                     />
-                    <Area type="monotone" dataKey="upperBound" stroke="transparent" fill="hsl(var(--primary) / 0.15)" name="Upper" />
-                    <Area type="monotone" dataKey="lowerBound" stroke="transparent" fill="hsl(var(--background))" name="Lower" />
-                    <Area type="monotone" dataKey="predicted" stroke="hsl(var(--primary))" fill="hsl(var(--primary) / 0.2)" strokeWidth={2} name="Predicted" />
-                    <Area type="monotone" dataKey="actual" stroke="hsl(var(--chart-2))" fill="transparent" strokeWidth={2} strokeDasharray="5 5" name="Actual" />
+                    <Area
+                      type="monotone"
+                      dataKey="predictedDemand"
+                      stroke="hsl(var(--primary))"
+                      fill="hsl(var(--primary) / 0.2)"
+                      strokeWidth={2}
+                      name="Predicted Demand"
+                    />
+                    <Area
+                      type="monotone"
+                      dataKey="shareableQuantity"
+                      stroke="hsl(var(--chart-2))"
+                      fill="transparent"
+                      strokeWidth={2}
+                      strokeDasharray="5 5"
+                      name="Shareable Qty"
+                    />
                   </AreaChart>
                 </ResponsiveContainer>
               </div>
@@ -591,35 +434,47 @@ const MLForecastingPage = () => {
 
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Priority Review</CardTitle>
-            <CardDescription>
-              Items with predicted pressure and suggested next actions.
-            </CardDescription>
+            <CardTitle className="text-base">Forecast Details</CardTitle>
+            <CardDescription>Per-resource predictions and restock recommendations.</CardDescription>
           </CardHeader>
           <CardContent>
             {rows.length === 0 ? (
-              <p className="text-sm text-muted-foreground">No recommendation rows available right now.</p>
+              <p className="text-sm text-muted-foreground">
+                {jobStatus === 'processing'
+                  ? 'Predictions are being computed…'
+                  : 'No forecast rows available.'}
+              </p>
             ) : (
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>Item</TableHead>
-                    <TableHead>Period</TableHead>
+                    <TableHead>Resource</TableHead>
+                    <TableHead>Horizon</TableHead>
                     <TableHead>Predicted</TableHead>
-                    <TableHead>Risk</TableHead>
-                    <TableHead>Recommendation</TableHead>
+                    <TableHead>Shareable</TableHead>
+                    <TableHead>Restock</TableHead>
+                    <TableHead>Amount</TableHead>
+                    <TableHead>Confidence</TableHead>
+                    <TableHead>Explanation</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {rows.slice(0, 10).map((row) => (
+                  {rows.map((row) => (
                     <TableRow key={row.key}>
-                      <TableCell className="font-medium">{row.itemName}</TableCell>
-                      <TableCell>{row.label}</TableCell>
-                      <TableCell>{Math.round(row.predicted)}</TableCell>
+                      <TableCell className="font-mono text-xs">{row.resourceCatalogId}</TableCell>
+                      <TableCell>{row.predictionHorizonDays}d</TableCell>
+                      <TableCell>{Math.round(row.predictedDemand)}</TableCell>
+                      <TableCell>{Math.round(row.shareableQuantity)}</TableCell>
                       <TableCell>
-                        <Badge variant={riskVariant(row.riskLevel)}>{row.riskLevel || 'unknown'}</Badge>
+                        <Badge variant={row.restock ? 'destructive' : 'default'}>
+                          {row.restock ? 'Yes' : 'No'}
+                        </Badge>
                       </TableCell>
-                      <TableCell className="max-w-[340px] truncate">{row.recommendation || 'Review stock and ordering cadence.'}</TableCell>
+                      <TableCell>{row.restock ? Math.round(row.restockAmount) : '—'}</TableCell>
+                      <TableCell>{Math.round(row.confidenceScore * 100)}%</TableCell>
+                      <TableCell className="max-w-[280px] truncate text-muted-foreground">
+                        {row.explanation || '—'}
+                      </TableCell>
                     </TableRow>
                   ))}
                 </TableBody>

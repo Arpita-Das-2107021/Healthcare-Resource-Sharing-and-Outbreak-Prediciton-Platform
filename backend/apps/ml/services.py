@@ -252,7 +252,7 @@ def _ensure_active_job_limit(facility: Hospital | None, job_type: str):
         ],
     ).count()
     if current_active >= setting.max_active_jobs_per_type:
-        raise ValidationError({"detail": "trigger rate limited for this facility and job_type."})
+        raise ValidationError({"code": "active_job_exists", "message": "An active job of this type already exists for this facility."})
 
 
 def _normalize_job_payload(validated_data: dict) -> dict:
@@ -688,7 +688,13 @@ def _candidate_facilities_for_catalog(catalog: ResourceCatalog, origin_facility:
     return items[:max_candidates]
 
 
-def _ensure_callback_headers(payload: dict, headers: dict, signature_payload: dict | str | None = None) -> str:
+def _ensure_callback_headers(
+    payload: dict,
+    headers: dict,
+    signature_payload: dict | str | None = None,
+    *,
+    allow_legacy_hmac: bool = False,
+) -> str:
     signature = headers.get("X-Signature") or headers.get("x-signature")
     request_id = headers.get("X-Request-Id") or headers.get("x-request-id")
     timestamp = headers.get("X-Timestamp") or headers.get("x-timestamp")
@@ -710,21 +716,11 @@ def _ensure_callback_headers(payload: dict, headers: dict, signature_payload: di
     if drift > ttl_seconds:
         raise AuthenticationFailed("Callback timestamp outside replay window.")
 
-    normalized_sig = signature.split("=", 1)[-1].strip()
-    normalized_sig_lower = normalized_sig.lower()
+    normalized_sig = signature.split("=", 1)[-1].strip().lower()
 
     configured_secret = str(getattr(settings, "ML_SERVER_B_HMAC_SECRET", "dev-secret")).strip()
-    fallback_secrets = [
-        str(value).strip()
-        for value in (getattr(settings, "ML_SERVER_B_HMAC_SECRET_FALLBACKS", []) or [])
-        if str(value).strip()
-    ]
-    secret_candidates = list(dict.fromkeys([configured_secret, *fallback_secrets]))
-    allow_server_b_sha256 = bool(getattr(settings, "ML_CALLBACK_ACCEPT_SERVER_B_SHA256", True))
-    allow_legacy_hmac = bool(getattr(settings, "ML_CALLBACK_ACCEPT_LEGACY_HMAC", True))
-
-    if not allow_server_b_sha256 and not allow_legacy_hmac:
-        raise AuthenticationFailed("Callback signature validation is disabled by configuration.")
+    if not configured_secret:
+        raise AuthenticationFailed("ML_SERVER_B_HMAC_SECRET is not configured.")
 
     candidate_payload_strings = []
     payload_for_signature = signature_payload if signature_payload is not None else payload
@@ -748,27 +744,25 @@ def _ensure_callback_headers(payload: dict, headers: dict, signature_payload: di
 
     signature_valid = False
     for payload_string in dict.fromkeys(candidate_payload_strings):
-        for secret_value in secret_candidates:
-            secret_bytes = secret_value.encode("utf-8")
+        callback_digest = hashlib.sha256(
+            f"{timestamp}.{request_id}.{payload_string}.{configured_secret}".encode("utf-8")
+        ).hexdigest()
+        if hmac.compare_digest(normalized_sig, callback_digest.lower()):
+            signature_valid = True
+            break
 
-            if allow_legacy_hmac:
-                # Legacy contract: HMAC-SHA256 over "<timestamp>.<canonical_json_payload>".
-                legacy_digest = hmac.new(secret_bytes, f"{timestamp}.{payload_string}".encode("utf-8"), hashlib.sha256).digest()
-                if (
-                    hmac.compare_digest(normalized_sig_lower, legacy_digest.hex().lower())
-                    or hmac.compare_digest(normalized_sig, base64.b64encode(legacy_digest).decode("ascii"))
-                ):
-                    signature_valid = True
-                    break
-
-            if allow_server_b_sha256:
-                # Real Server B contract: SHA256("<timestamp>.<request_id>.<canonical_json_payload>.<secret>").
-                callback_digest = hashlib.sha256(
-                    f"{timestamp}.{request_id}.{payload_string}.{secret_value}".encode("utf-8")
-                ).hexdigest()
-                if hmac.compare_digest(normalized_sig_lower, callback_digest.lower()):
-                    signature_valid = True
-                    break
+        if allow_legacy_hmac:
+            legacy_digest = hmac.new(
+                configured_secret.encode("utf-8"),
+                f"{timestamp}.{payload_string}".encode("utf-8"),
+                hashlib.sha256,
+            ).digest()
+            if (
+                hmac.compare_digest(normalized_sig, legacy_digest.hex().lower())
+                or hmac.compare_digest(normalized_sig, base64.b64encode(legacy_digest).decode("ascii").lower())
+            ):
+                signature_valid = True
+                break
         if signature_valid:
             break
 
@@ -795,14 +789,18 @@ def _validate_outbreak_neighbors(payload: dict, max_neighbors: int):
         if len(neighbor_list) > max_neighbors:
             raise ValidationError({"neighbors": "Neighbor count exceeds max_neighbors."})
 
-        prev_distance = None
+        sortable_neighbors = []
         for row in neighbor_list:
+            neighbor_facility_id = str(row.get("facility_id") or "").strip()
+            if not neighbor_facility_id:
+                raise ValidationError({"neighbors": "Each neighbor requires facility_id."})
             distance_km = Decimal(str(row.get("distance_km", 0)))
             if distance_km < 0:
                 raise ValidationError({"neighbors": "distance_km must be non-negative."})
-            if prev_distance is not None and distance_km < prev_distance:
-                raise ValidationError({"neighbors": "Neighbors must be sorted by distance_km ascending."})
-            prev_distance = distance_km
+            sortable_neighbors.append((distance_km, neighbor_facility_id))
+
+        if sortable_neighbors != sorted(sortable_neighbors, key=lambda item: (item[0], item[1])):
+            raise ValidationError({"neighbors": "Neighbors must be sorted by distance_km then facility_id ascending."})
 
 
 def _save_forecast_result(job: MLJob, row: dict):
@@ -813,13 +811,21 @@ def _save_forecast_result(job: MLJob, row: dict):
     confidence = row.get("confidence_score", 0)
     _assert_probability(confidence, "confidence_score")
 
+    facility_id = str(row.get("facility_id") or "").strip()
+    if not facility_id:
+        raise ValidationError({"facility_id": "facility_id is required for forecast rows."})
+
+    resource_catalog_id = str(row.get("resource_catalog_id") or "").strip()
+    if not resource_catalog_id:
+        raise ValidationError({"resource_catalog_id": "resource_catalog_id is required for forecast rows."})
+
     try:
-        facility = Hospital.objects.get(id=row.get("facility_id") or job.facility_id)
+        facility = Hospital.objects.get(id=facility_id)
     except Hospital.DoesNotExist:
         raise ValidationError({"facility_id": "Facility not found."})
 
     try:
-        catalog = ResourceCatalog.objects.select_related("inventory").get(id=row.get("resource_catalog_id"), hospital=facility)
+        catalog = ResourceCatalog.objects.select_related("inventory").get(id=resource_catalog_id, hospital=facility)
     except ResourceCatalog.DoesNotExist:
         raise ValidationError({"resource_catalog_id": "Resource catalog not found for facility."})
 
@@ -882,13 +888,36 @@ def _save_outbreak_result(job: MLJob, row: dict, neighbors_payload: dict):
     probability = Decimal(str(row.get("outbreak_probability", 0)))
     _assert_probability(probability, "outbreak_probability")
 
+    facility_id = str(row.get("facility_id") or "").strip()
+    if not facility_id:
+        raise ValidationError({"facility_id": "facility_id is required for outbreak rows."})
+
     try:
-        facility = Hospital.objects.get(id=row.get("facility_id") or job.facility_id)
+        facility = Hospital.objects.get(id=facility_id)
     except Hospital.DoesNotExist:
         raise ValidationError({"facility_id": "Facility not found."})
 
     setting, _ = FacilityMLSetting.objects.get_or_create(facility=facility)
     risk_level = _risk_level(probability, setting)
+
+    upazila = str(row.get("upazila") or "")
+    ml_status = str(row.get("status") or "")
+    likely_disease = str(row.get("likely_disease") or "")
+    social_confirmation = str(row.get("social_confirmation") or "")
+    social_score_raw = row.get("social_score")
+    social_score = Decimal(str(social_score_raw)) if social_score_raw is not None else None
+    
+    # Store enriched fields from ML server (model_prob and final_confidence)
+    model_prob_raw = row.get("model_prob")
+    model_prob = Decimal(str(model_prob_raw)) if model_prob_raw is not None else None
+    final_confidence_raw = row.get("final_confidence")
+    final_confidence = Decimal(str(final_confidence_raw)) if final_confidence_raw is not None else None
+
+    explanation = social_confirmation if social_confirmation else (
+        "High outbreak risk detected due to trend signal"
+        if risk_level == MLOutbreakResult.RiskLevel.HIGH
+        else "Outbreak risk monitored"
+    )
 
     facility_neighbors = neighbors_payload.get(str(facility.id), [])
     filtered_neighbors = []
@@ -896,6 +925,7 @@ def _save_outbreak_result(job: MLJob, row: dict, neighbors_payload: dict):
         filtered_neighbors.append(
             {
                 "facility_id": str(neighbor.get("facility_id")),
+                "upazila": str(neighbor.get("upazila", "")),
                 "distance_km": float(neighbor.get("distance_km", 0)),
             }
         )
@@ -915,6 +945,7 @@ def _save_outbreak_result(job: MLJob, row: dict, neighbors_payload: dict):
         request_candidates.append(
             {
                 "facility_id": entry["facility_id"],
+                "upazila": entry["upazila"],
                 "distance_km": entry["distance_km"],
                 "available_quantity": int(total_available or 0),
             }
@@ -927,8 +958,15 @@ def _save_outbreak_result(job: MLJob, row: dict, neighbors_payload: dict):
             "prediction_horizon_days": int(job.parameters.get("prediction_horizon_days", 1)),
             "outbreak_probability": probability,
             "outbreak_flag": bool(row.get("outbreak_flag", False)),
+            "model_prob": model_prob,
+            "final_confidence": final_confidence,
             "risk_level": risk_level,
-            "explanation": "High outbreak risk detected due to trend signal" if risk_level == MLOutbreakResult.RiskLevel.HIGH else "Outbreak risk monitored",
+            "upazila": upazila,
+            "ml_status": ml_status,
+            "likely_disease": likely_disease,
+            "social_score": social_score,
+            "social_confirmation": social_confirmation,
+            "explanation": explanation,
             "decision_log": {
                 "inputs": {"outbreak_probability": float(probability)},
                 "thresholds": {
@@ -1118,9 +1156,17 @@ def get_outbreak_results(job: MLJob, user) -> dict:
         "items": [
             {
                 "facility_id": str(item.facility_id),
+                "upazila": item.upazila,
                 "prediction_horizon_days": item.prediction_horizon_days,
                 "outbreak_probability": float(item.outbreak_probability),
+                "outbreak_flag": item.outbreak_flag,
+                "model_prob": float(item.model_prob) if item.model_prob is not None else None,
+                "final_confidence": float(item.final_confidence) if item.final_confidence is not None else None,
                 "risk_level": item.risk_level,
+                "ml_status": item.ml_status,
+                "likely_disease": item.likely_disease,
+                "social_score": float(item.social_score) if item.social_score is not None else None,
+                "social_confirmation": item.social_confirmation,
                 "explanation": item.explanation,
                 "decision_log": item.decision_log,
                 "neighbors": item.neighbors,
@@ -1164,6 +1210,8 @@ def get_latest_forecast_for_facility(user, facility_id) -> dict:
     return {
         "job_id": str(job.id),
         "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+        "has_partial_failures": job.has_partial_failures,
+        "partial_failure_count": job.partial_failure_count,
         "items": items,
     }
 
@@ -1185,6 +1233,8 @@ def get_latest_outbreak_for_facility(user, facility_id) -> dict:
     return {
         "job_id": str(job.id),
         "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+        "has_partial_failures": job.has_partial_failures,
+        "partial_failure_count": job.partial_failure_count,
         "items": items,
     }
 
@@ -1234,6 +1284,94 @@ def get_request_suggestions(user, facility_id) -> dict:
         "facility_id": str(facility_id),
         "items": items,
     }
+
+
+def trigger_facility_refresh(user, facility_id, job_type: str, prediction_horizon_days: int, idempotency_key: str) -> dict:
+    """Trigger an on-demand ML inference job for a facility using direct JSON payload (no MinIO)."""
+    from .inference_services import create_json_inference_job  # noqa: PLC0415
+
+    model_key = "model1" if job_type == MLJob.JobType.FORECAST else "model2"
+
+    try:
+        facility = Hospital.objects.get(id=facility_id)
+    except Hospital.DoesNotExist:
+        raise NotFound("Facility not found.")
+
+    upazila = str(
+        facility.region_level_2
+        or facility.city
+        or facility.region_level_1
+        or facility.state
+        or facility.country
+        or "UNKNOWN"
+    )
+
+    if model_key == "model1":
+        catalogs = list(
+            ResourceCatalog.objects.filter(hospital=facility)
+            .select_related("inventory")
+            .order_by("name")[:25]
+        )
+        rows = []
+        for catalog in catalogs:
+            inventory = getattr(catalog, "inventory", None)
+            available = float(
+                max(0, inventory.quantity_available - inventory.reserved_quantity)
+            ) if inventory else 0.0
+            rows.append(
+                {
+                    "facility_id": str(facility.id),
+                    "resource_catalog_id": str(catalog.id),
+                    "features": {
+                        "medicine_name": str(catalog.name),
+                        "upazila": upazila,
+                        "signals_disease": "baseline",
+                        "base_daily_sales": max(1.0, round(available / 30.0, 2)),
+                        "outbreak_multiplier": 1.1,
+                    },
+                }
+            )
+        inference_input: dict = {"rows": rows}
+    else:
+        catalogs_qs = list(
+            ResourceCatalog.objects.filter(hospital=facility).select_related("inventory")
+        )
+        total_available = sum(
+            max(0, c.inventory.quantity_available - c.inventory.reserved_quantity)
+            for c in catalogs_qs
+            if getattr(c, "inventory", None)
+        )
+        recent_avg = round(float(total_available) / 30.0, 2) if total_available > 0 else 45.0
+        baseline_avg = round(recent_avg * 0.75, 2)
+        rows = [
+            {
+                "facility_id": str(facility.id),
+                "upazila": upazila,
+                "features": {
+                    "recent_avg_sales": recent_avg,
+                    "baseline_avg_sales": baseline_avg,
+                    "neighbor_trend_score": 0.0,
+                    "outbreak_signal": 0.0,
+                },
+            }
+        ]
+        inference_input = {"rows": rows, "neighbors": {}}
+
+    validated_data: dict = {
+        "facility_id": str(facility_id),
+        "prediction_horizon_days": prediction_horizon_days,
+        "input": inference_input,
+        "model_version": "",
+    }
+    if model_key == "model2":
+        validated_data["max_neighbors"] = 20
+
+    return create_json_inference_job(
+        actor=user,
+        model_key=model_key,
+        validated_data=validated_data,
+        idempotency_key=idempotency_key,
+    )
 
 
 def update_facility_settings(user, facility_id, data: dict) -> FacilityMLSetting:

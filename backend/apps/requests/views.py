@@ -4,6 +4,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from django.conf import settings
 from django.http import HttpResponseRedirect
+from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
@@ -35,11 +36,13 @@ from .serializers import (
     PaymentReconciliationRunSerializer,
     RefundConfirmSerializer,
     RefundInitiateSerializer,
+    RefundRequestSerializer,
     ReserveRequestSerializer,
     ResourceRequestSerializer,
     TransferConfirmSerializer,
     VerifyReturnSerializer,
 )
+from .models import RefundRequest
 from .services import (
     approve_request,
     cancel_request,
@@ -205,7 +208,16 @@ class ResourceRequestViewSet(EnforceDomainContextMixin, viewsets.ModelViewSet):
         req = self.get_object()
         serializer = VerifyReturnSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        verify_return(req=req, return_token=serializer.validated_data["return_token"], actor=request.user)
+        d = serializer.validated_data
+        verify_return(
+            req=req,
+            return_token=d["return_token"],
+            actor=request.user,
+            quantity_returned=d.get("quantity_returned"),
+            quantity_damaged=d.get("quantity_damaged", 0),
+            quantity_lost=d.get("quantity_lost", 0),
+            verification_notes=d.get("verification_notes", ""),
+        )
         return Response(success_response(data=ResourceRequestSerializer(req).data))
 
     @action(detail=True, methods=["post"], url_path="approve", permission_classes=[IsAuthenticated, IsHospitalAdmin])
@@ -267,7 +279,16 @@ class ResourceRequestViewSet(EnforceDomainContextMixin, viewsets.ModelViewSet):
         req = self.get_object()
         s = VerifyReturnSerializer(data=request.data)
         s.is_valid(raise_exception=True)
-        verify_return(req=req, return_token=s.validated_data["return_token"], actor=request.user)
+        d = s.validated_data
+        verify_return(
+            req=req,
+            return_token=d["return_token"],
+            actor=request.user,
+            quantity_returned=d.get("quantity_returned"),
+            quantity_damaged=d.get("quantity_damaged", 0),
+            quantity_lost=d.get("quantity_lost", 0),
+            verification_notes=d.get("verification_notes", ""),
+        )
         return Response(success_response(data=ResourceRequestSerializer(req).data))
 
     @action(detail=True, methods=["post"], url_path="reserve", permission_classes=[IsAuthenticated, IsHospitalAdmin])
@@ -350,7 +371,16 @@ class ResourceRequestViewSet(EnforceDomainContextMixin, viewsets.ModelViewSet):
         req = self.get_object()
         serializer = RefundInitiateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        payload = initiate_refund(req=req, actor=request.user, reason=serializer.validated_data.get("reason", ""))
+        d = serializer.validated_data
+        payload = initiate_refund(
+            req=req,
+            actor=request.user,
+            cause=d["cause"],
+            cause_note=d.get("cause_note", ""),
+            idempotency_key=d.get("idempotency_key", "") or request.headers.get("Idempotency-Key", ""),
+            returned_quantity=d.get("returned_quantity"),
+            damaged_quantity=d.get("damaged_quantity", 0),
+        )
         return Response(success_response(data=payload))
 
     @action(detail=True, methods=["post"], url_path="refunds/confirm", permission_classes=[IsAuthenticated, IsHospitalAdmin])
@@ -367,6 +397,22 @@ class ResourceRequestViewSet(EnforceDomainContextMixin, viewsets.ModelViewSet):
             provider_transaction_id=data.get("provider_transaction_id", ""),
         )
         return Response(success_response(data=payload))
+
+    @action(detail=True, methods=["get"], url_path="refunds/status", permission_classes=[IsAuthenticated, IsHospitalAdmin])
+    def refund_status_action(self, request, pk=None):
+        _ensure_permission(request.user, ("hospital:payment.refund.initiate", "hospital:payment.refund.confirm"))
+        req = self.get_object()
+        refund_req = (
+            RefundRequest.objects.filter(request=req)
+            .exclude(refund_status__in=["REFUND_FAILED", "CANCELLED"])
+            .order_by("-created_at")
+            .first()
+        )
+        if not refund_req:
+            refund_req = RefundRequest.objects.filter(request=req).order_by("-created_at").first()
+        if not refund_req:
+            return Response(success_response(data=None, message="No refund request found for this request."))
+        return Response(success_response(data=RefundRequestSerializer(refund_req).data))
 
     @action(detail=False, methods=["post"], url_path="expire", permission_classes=[IsAuthenticated, IsHospitalAdmin])
     def expire_action(self, request):
@@ -391,7 +437,11 @@ class ResourceRequestViewSet(EnforceDomainContextMixin, viewsets.ModelViewSet):
             date_to=date_to,
             actor=request.user,
         )
-        return Response(success_response(data=payload))
+        meta = {
+            "generated_at": timezone.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "record_count": len(payload.get("transactions", [])),
+        }
+        return Response(success_response(data=payload, message="Payment report fetched successfully", meta=meta))
 
     @action(detail=False, methods=["post"], url_path="payments/reconcile", permission_classes=[IsAuthenticated, IsHospitalAdmin])
     def reconcile_payments_action(self, request):

@@ -58,6 +58,25 @@ describe('ResourceVisibility', () => {
   });
 
   it('renders inventory options including entries with shared quantity 0', async () => {
+    mockGetAllInventory.mockResolvedValue({
+      data: [
+        {
+          id: 'inv-1',
+          catalog_item: 'cat-1',
+          catalog_item_name: 'Ventilator',
+          resource_type: 'equipment',
+          price_per_unit: 250,
+        },
+        {
+          id: 'inv-2',
+          catalog_item: 'cat-2',
+          catalog_item_name: 'Oxygen Cylinder',
+          resource_type: 'equipment',
+          price_per_unit: null,
+        },
+      ],
+    });
+
     mockGetShareVisibility.mockResolvedValue({
       data: [
         {
@@ -86,8 +105,17 @@ describe('ResourceVisibility', () => {
     renderResourceVisibility();
 
     const table = await screen.findByRole('table');
+    expect(within(table).getByText('Cost')).toBeInTheDocument();
     expect(within(table).getByText('Ventilator')).toBeInTheDocument();
     expect(within(table).getByText('Oxygen Cylinder')).toBeInTheDocument();
+
+    const ventilatorRow = within(table).getByText('Ventilator').closest('tr');
+    expect(ventilatorRow).not.toBeNull();
+    expect(within(ventilatorRow as HTMLTableRowElement).getByText('৳250')).toBeInTheDocument();
+
+    const oxygenRow = within(table).getByText('Oxygen Cylinder').closest('tr');
+    expect(oxygenRow).not.toBeNull();
+    expect(within(oxygenRow as HTMLTableRowElement).getByText('-')).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole('tab', { name: /Non Shared/i }));
 

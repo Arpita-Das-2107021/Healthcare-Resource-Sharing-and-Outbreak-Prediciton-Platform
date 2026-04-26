@@ -116,6 +116,96 @@ interface DispatchSnapshot {
   dispatchTokenExpiresAt?: string;
 }
 
+interface DispatchCacheEntry extends DispatchSnapshot {
+  workflowState?: string;
+  completionStage?: CompletionStage;
+}
+
+type DispatchCacheByRequestId = Record<string, DispatchCacheEntry>;
+
+const DISPATCH_QR_CACHE_STORAGE_KEY = 'request-workflow:dispatch-qr-cache:v1';
+const DISPATCH_SCAN_REQUEST_CONTEXT_KEY = 'dispatch-scan:request-id';
+
+const hasDispatchSnapshotData = (snapshot?: DispatchSnapshot | null): boolean =>
+  Boolean(
+    snapshot?.dispatchToken ||
+      snapshot?.dispatchQrPayload ||
+      snapshot?.dispatchQrImageUrl ||
+      snapshot?.shipmentId ||
+      snapshot?.dispatchTokenExpiresAt
+  );
+
+const shouldRetainDispatchCache = (workflowState: string, completionStage: CompletionStage): boolean => {
+  const mappedState = mapStatus(workflowState);
+  if (TERMINAL_WORKFLOW_STATES.has(mappedState)) {
+    return false;
+  }
+  if (completionStage === 'RECEIVER_CONFIRMED') {
+    return false;
+  }
+  return true;
+};
+
+const readDispatchQrCache = (): DispatchCacheByRequestId => {
+  if (typeof window === 'undefined') {
+    return {};
+  }
+
+  try {
+    const raw = window.localStorage.getItem(DISPATCH_QR_CACHE_STORAGE_KEY);
+    if (!raw) {
+      return {};
+    }
+
+    const parsed = JSON.parse(raw) as unknown;
+    const root = asRecord(parsed);
+    const cache: DispatchCacheByRequestId = {};
+
+    Object.entries(root).forEach(([requestId, value]) => {
+      const record = asRecord(value);
+      const entry: DispatchCacheEntry = {
+        requestId,
+        shipmentId: readIdFromUnknown(record.shipmentId ?? record.shipment_id) || undefined,
+        dispatchToken: readString(record, ['dispatchToken', 'dispatch_token']) || undefined,
+        dispatchQrPayload:
+          takeOpaqueQrPayload(
+            readString(record, ['dispatchQrPayload', 'dispatch_qr_payload']),
+            readString(record, ['dispatchToken', 'dispatch_token'])
+          ) || undefined,
+        dispatchQrImageUrl: readString(record, ['dispatchQrImageUrl', 'dispatch_qr_image_url']) || undefined,
+        dispatchTokenExpiresAt: readDateTime(record, ['dispatchTokenExpiresAt', 'dispatch_token_expires_at']) || undefined,
+        workflowState: readString(record, ['workflowState', 'workflow_state']) || undefined,
+        completionStage:
+          readString(record, ['completionStage', 'completion_stage']) === 'RECEIVER_CONFIRMED'
+            ? 'RECEIVER_CONFIRMED'
+            : readString(record, ['completionStage', 'completion_stage']) === 'SENDER_CONFIRMED'
+              ? 'SENDER_CONFIRMED'
+              : 'NOT_STARTED',
+      };
+
+      if (hasDispatchSnapshotData(entry)) {
+        cache[requestId] = entry;
+      }
+    });
+
+    return cache;
+  } catch {
+    return {};
+  }
+};
+
+const writeDispatchQrCache = (cache: DispatchCacheByRequestId) => {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(DISPATCH_QR_CACHE_STORAGE_KEY, JSON.stringify(cache));
+  } catch {
+    // Ignore localStorage write failures.
+  }
+};
+
 const WORKFLOW_STATES: WorkflowState[] = [
   'PENDING',
   'APPROVED',
@@ -537,6 +627,15 @@ const mapApiRequest = (req: unknown): MappedRequest => {
       latestShipmentDispatchSnapshot.dispatchQrPayload,
     ) || undefined;
 
+  const dispatchToken =
+    takeToken(
+      requestDispatchSnapshot.dispatchToken,
+      completionDispatchSnapshot.dispatchToken,
+      transferDispatchSnapshot.dispatchToken,
+      shipmentDispatchSnapshot.dispatchToken,
+      latestShipmentDispatchSnapshot.dispatchToken,
+    ) || undefined;
+
   const dispatchQrImageUrl =
     takeToken(
       requestDispatchSnapshot.dispatchQrImageUrl,
@@ -598,8 +697,8 @@ const mapApiRequest = (req: unknown): MappedRequest => {
       readIdFromUnknown(shipment.id) ||
       readIdFromUnknown(latestShipment.id) ||
       undefined,
-    dispatchToken: undefined,
-    dispatchQrPayload,
+    dispatchToken,
+    dispatchQrPayload: dispatchQrPayload || dispatchToken,
     dispatchQrImageUrl,
     completionStage,
     senderConfirmedAt: senderConfirmedAt || undefined,
@@ -638,12 +737,21 @@ const getDispatchSnapshotFromRecord = (record: Record<string, unknown>): Dispatc
   const dispatchContext = asRecord(record.dispatch_context);
   const tokens = asRecord(record.tokens);
 
+  const dispatchToken =
+    takeToken(
+      readString(deliveryQr, ['dispatch_token', 'dispatchToken', 'token']),
+      readString(dispatchContext, ['dispatch_token', 'dispatchToken', 'token']),
+      readString(tokens, ['dispatch_token', 'dispatchToken']),
+      readString(record, ['dispatch_token', 'dispatchToken'])
+    ) || undefined;
+
   const dispatchQrPayload =
     takeOpaqueQrPayload(
       readString(deliveryQr, ['qrPayload', 'qr_payload', 'qr_signature', 'qrSignature', 'signature']),
       readString(dispatchContext, ['qrPayload', 'qr_payload', 'qr_signature', 'qrSignature', 'signature']),
       readString(tokens, ['dispatch_qr_payload', 'dispatch_qr_signature', 'dispatch_signature', 'qr_signature', 'signature']),
-      readString(record, ['dispatch_qr_payload', 'dispatchQrPayload', 'qr_payload', 'qrPayload', 'qr_signature', 'qrSignature', 'signature', 'signed_qr_payload'])
+      readString(record, ['dispatch_qr_payload', 'dispatchQrPayload', 'qr_payload', 'qrPayload', 'qr_signature', 'qrSignature', 'signature', 'signed_qr_payload']),
+      dispatchToken
     ) || undefined;
 
   const dispatchQrImageUrl =
@@ -673,7 +781,7 @@ const getDispatchSnapshotFromRecord = (record: Record<string, unknown>): Dispatc
       readIdFromUnknown(record.latest_shipment) ||
       readIdFromUnknown(record.latest_shipment_id) ||
       undefined,
-    dispatchToken: undefined,
+    dispatchToken,
     dispatchQrPayload,
     dispatchQrImageUrl,
     dispatchTokenExpiresAt,
@@ -694,7 +802,7 @@ const extractDispatchSessionFromPayload = (payload: unknown, fallbackRequestId: 
     }
 
     const snapshot = getDispatchSnapshotFromRecord(candidate);
-    if (snapshot.dispatchQrPayload || snapshot.dispatchQrImageUrl || snapshot.shipmentId) {
+    if (snapshot.dispatchToken || snapshot.dispatchQrPayload || snapshot.dispatchQrImageUrl || snapshot.shipmentId) {
       return {
         ...snapshot,
         requestId: snapshot.requestId || fallbackRequestId,
@@ -729,7 +837,7 @@ const mapShipmentFromPayload = (payload: unknown, requestId: string): ShipmentIn
       ['status', 'workflow_state'],
       readString(data, ['status', 'workflow_state'], readString(root, ['status', 'workflow_state']))
     ),
-    dispatchToken: undefined,
+    dispatchToken: snapshot.dispatchToken,
     dispatchQrPayload: snapshot.dispatchQrPayload,
     dispatchQrImageUrl: snapshot.dispatchQrImageUrl,
     returnToken: undefined,
@@ -743,44 +851,58 @@ const mapShipmentFromPayload = (payload: unknown, requestId: string): ShipmentIn
 const mergeRequestWithCachedDispatchData = (
   incoming: MappedRequest,
   existing?: MappedRequest,
+  cached?: DispatchSnapshot,
 ): MappedRequest => {
-  if (!existing) {
+  if (!existing && !cached) {
     return incoming;
   }
 
   return {
     ...incoming,
-    shipmentId: incoming.shipmentId || existing.shipmentId,
-    dispatchToken: incoming.dispatchToken || existing.dispatchToken,
-    dispatchQrPayload: incoming.dispatchQrPayload || existing.dispatchQrPayload,
-    dispatchQrImageUrl: incoming.dispatchQrImageUrl || existing.dispatchQrImageUrl,
-    dispatchTokenExpiresAt: incoming.dispatchTokenExpiresAt || existing.dispatchTokenExpiresAt,
+    shipmentId: incoming.shipmentId || existing?.shipmentId || cached?.shipmentId,
+    dispatchToken: incoming.dispatchToken || existing?.dispatchToken || cached?.dispatchToken,
+    dispatchQrPayload:
+      incoming.dispatchQrPayload ||
+      existing?.dispatchQrPayload ||
+      cached?.dispatchQrPayload ||
+      cached?.dispatchToken,
+    dispatchQrImageUrl: incoming.dispatchQrImageUrl || existing?.dispatchQrImageUrl || cached?.dispatchQrImageUrl,
+    dispatchTokenExpiresAt:
+      incoming.dispatchTokenExpiresAt || existing?.dispatchTokenExpiresAt || cached?.dispatchTokenExpiresAt,
   };
 };
 
 const mergeShipmentWithCachedDispatchData = (
   incoming: ShipmentInfo,
   existing?: ShipmentInfo,
+  cached?: DispatchSnapshot,
 ): ShipmentInfo => {
   if (!existing) {
     return {
       ...incoming,
+      id: incoming.id || cached?.shipmentId || '',
+      requestId: incoming.requestId || cached?.requestId,
+      status: incoming.status || existing?.status || 'IN_TRANSIT',
       dispatchToken: incoming.dispatchToken || undefined,
-      dispatchQrPayload: incoming.dispatchQrPayload || undefined,
-      dispatchQrImageUrl: incoming.dispatchQrImageUrl || undefined,
+      dispatchQrPayload: incoming.dispatchQrPayload || cached?.dispatchQrPayload || cached?.dispatchToken || undefined,
+      dispatchQrImageUrl: incoming.dispatchQrImageUrl || cached?.dispatchQrImageUrl || undefined,
       returnToken: incoming.returnToken || undefined,
-      tokenExpiresAt: incoming.tokenExpiresAt || undefined,
+      tokenExpiresAt: incoming.tokenExpiresAt || cached?.dispatchTokenExpiresAt || undefined,
     };
   }
 
   return {
     ...existing,
     ...incoming,
-    dispatchToken: incoming.dispatchToken || existing.dispatchToken,
-    dispatchQrPayload: incoming.dispatchQrPayload || existing.dispatchQrPayload,
-    dispatchQrImageUrl: incoming.dispatchQrImageUrl || existing.dispatchQrImageUrl,
+    dispatchToken: incoming.dispatchToken || existing.dispatchToken || cached?.dispatchToken,
+    dispatchQrPayload:
+      incoming.dispatchQrPayload ||
+      existing.dispatchQrPayload ||
+      cached?.dispatchQrPayload ||
+      cached?.dispatchToken,
+    dispatchQrImageUrl: incoming.dispatchQrImageUrl || existing.dispatchQrImageUrl || cached?.dispatchQrImageUrl,
     returnToken: incoming.returnToken || existing.returnToken,
-    tokenExpiresAt: incoming.tokenExpiresAt || existing.tokenExpiresAt,
+    tokenExpiresAt: incoming.tokenExpiresAt || existing.tokenExpiresAt || cached?.dispatchTokenExpiresAt,
   };
 };
 
@@ -809,16 +931,17 @@ const upsertShipment = (existing: ShipmentInfo[], incoming: ShipmentInfo): Shipm
 };
 
 type QrDownloadFormat = 'svg' | 'png' | 'jpg';
-type QrDisplaySize = '160' | '220' | '280' | '340';
+type QrDisplaySize = '160' | '220' | '280' | '340' | '420';
 const QR_QUIET_ZONE_RATIO = 0.14;
 const QR_MIN_QUIET_ZONE_PX = 16;
 
-const DEFAULT_QR_DISPLAY_SIZE: QrDisplaySize = '220';
+const DEFAULT_QR_DISPLAY_SIZE: QrDisplaySize = '340';
 const QR_DISPLAY_SIZE_OPTIONS: Array<{ value: QrDisplaySize; label: string }> = [
   { value: '160', label: 'Small (160px)' },
   { value: '220', label: 'Medium (220px)' },
   { value: '280', label: 'Large (280px)' },
   { value: '340', label: 'XL (340px)' },
+  { value: '420', label: 'XXL (420px)' },
 ];
 
 const getQrDownloadMime = (format: QrDownloadFormat): string => {
@@ -843,6 +966,29 @@ const loadImageElement = async (url: string): Promise<HTMLImageElement> =>
     image.onerror = () => reject(new Error('Failed to load QR image.'));
     image.src = url;
   });
+
+const parseSvgSizeValue = (raw?: string | null): number => {
+  if (!raw) return 0;
+  const parsed = Number.parseFloat(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+};
+
+const resolveQrSourceSize = (element: SVGSVGElement): number => {
+  const viewBoxSize = Math.max(element.viewBox.baseVal.width || 0, element.viewBox.baseVal.height || 0);
+  if (viewBoxSize > 0) {
+    return viewBoxSize;
+  }
+
+  const widthAttr = parseSvgSizeValue(element.getAttribute('width'));
+  const heightAttr = parseSvgSizeValue(element.getAttribute('height'));
+  const attrSize = Math.max(widthAttr, heightAttr);
+  if (attrSize > 0) {
+    return attrSize;
+  }
+
+  const rect = element.getBoundingClientRect();
+  return Math.max(Math.ceil(rect.width || 0), Math.ceil(rect.height || 0), 1);
+};
 
 const resolveQrPixelSize = (element: SVGSVGElement, outputSize?: number): number => {
   const targetSize =
@@ -877,7 +1023,7 @@ const downloadQrSvg = async (
 
   const serializer = new XMLSerializer();
   const source = serializer.serializeToString(element);
-  const sourceSize = resolveQrPixelSize(element);
+  const sourceSize = resolveQrSourceSize(element);
   const qrSize = resolveQrPixelSize(element, outputSize);
   const quietZone = getQrQuietZoneSize(qrSize);
   const totalSize = qrSize + quietZone * 2;
@@ -969,9 +1115,22 @@ const downloadQrImage = async (
   }
 };
 
-const printQrSection = (sectionId: string, title: string): boolean => {
+const printQrSection = (sectionId: string, title: string, outputSize?: number): boolean => {
   const section = document.getElementById(sectionId);
   if (!section) return false;
+
+  const clonedSection = section.cloneNode(true);
+  if (!(clonedSection instanceof HTMLElement)) {
+    return false;
+  }
+
+  clonedSection.classList.add('qr-print-target');
+
+  const printQrSize =
+    typeof outputSize === 'number' && Number.isFinite(outputSize) && outputSize > 0
+      ? Math.max(Math.floor(outputSize), 320)
+      : 420;
+  const printQuietZone = getQrQuietZoneSize(printQrSize);
 
   const printWindow = window.open('', '_blank', 'noopener,noreferrer,width=760,height=920');
   if (!printWindow) return false;
@@ -983,23 +1142,64 @@ const printQrSection = (sectionId: string, title: string): boolean => {
   <meta charset="utf-8" />
   <title>${escapedTitle}</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 24px; color: #111827; }
+    @page { size: auto; margin: 12mm; }
+    body { font-family: Arial, sans-serif; margin: 0; color: #111827; }
     h1 { font-size: 18px; margin: 0 0 12px; }
     p { font-size: 13px; margin: 0 0 12px; color: #374151; }
-    .qr-print-wrapper { border: 1px solid #d1d5db; border-radius: 8px; padding: 16px; max-width: 460px; }
-    .qr-print-wrapper img,
-    .qr-print-wrapper svg { max-width: 320px; height: auto; }
+    .print-container { padding: 18px; }
+    .qr-print-wrapper {
+      border: 1px solid #d1d5db;
+      border-radius: 10px;
+      padding: 20px;
+      max-width: 760px;
+      background: #ffffff;
+    }
+    .qr-print-target {
+      display: inline-flex !important;
+      align-items: center;
+      justify-content: center;
+      background: #ffffff;
+      border: 2px solid #111827;
+      border-radius: 12px;
+      box-sizing: content-box;
+      padding: ${printQuietZone}px !important;
+    }
+    .qr-print-target img,
+    .qr-print-target svg {
+      width: ${printQrSize}px !important;
+      height: ${printQrSize}px !important;
+      max-width: none !important;
+      max-height: none !important;
+      display: block;
+      image-rendering: crisp-edges;
+    }
   </style>
 </head>
 <body>
-  <h1>${escapedTitle}</h1>
-  <p>Print and attach this QR to the shipment package.</p>
-  <div class="qr-print-wrapper">${section.innerHTML}</div>
+  <div class="print-container">
+    <h1>${escapedTitle}</h1>
+    <p>Print and attach this QR to the shipment package.</p>
+    <div class="qr-print-wrapper">${clonedSection.outerHTML}</div>
+  </div>
   <script>
-    window.addEventListener('load', function () {
-      window.print();
-      window.close();
-    });
+    (function () {
+      window.addEventListener('afterprint', function () {
+        window.close();
+      });
+
+      const runPrint = function () {
+        window.focus();
+        window.print();
+      };
+
+      if (document.readyState === 'complete') {
+        setTimeout(runPrint, 180);
+      } else {
+        window.addEventListener('load', function () {
+          setTimeout(runPrint, 180);
+        }, { once: true });
+      }
+    })();
   </script>
 </body>
 </html>`);
@@ -1130,6 +1330,7 @@ const RequestWorkflow = ({ view = 'combined' }: RequestWorkflowProps) => {
   const [paymentLoadingId, setPaymentLoadingId] = useState<string | null>(null);
 
   const gatewayReturnQueryHandledRef = useRef('');
+  const dispatchQrCacheRef = useRef<DispatchCacheByRequestId>(readDispatchQrCache());
 
   const userHospitalId = String(user?.hospital_id || '');
   const userContext = String(user?.context || '').trim().toUpperCase();
@@ -1162,6 +1363,72 @@ const RequestWorkflow = ({ view = 'combined' }: RequestWorkflowProps) => {
     });
   }, []);
 
+  useEffect(() => {
+    const nextCache: DispatchCacheByRequestId = { ...dispatchQrCacheRef.current };
+
+    requests.forEach((request) => {
+      const requestId = request.id;
+      if (!requestId) {
+        return;
+      }
+
+      if (!shouldRetainDispatchCache(request.status, request.completionStage)) {
+        delete nextCache[requestId];
+        return;
+      }
+
+      const existing = nextCache[requestId];
+      const nextEntry: DispatchCacheEntry = {
+        requestId,
+        shipmentId: request.shipmentId || existing?.shipmentId,
+        dispatchToken: request.dispatchToken || existing?.dispatchToken,
+        dispatchQrPayload:
+          request.dispatchQrPayload ||
+          existing?.dispatchQrPayload ||
+          request.dispatchToken ||
+          existing?.dispatchToken,
+        dispatchQrImageUrl: request.dispatchQrImageUrl || existing?.dispatchQrImageUrl,
+        dispatchTokenExpiresAt: request.dispatchTokenExpiresAt || existing?.dispatchTokenExpiresAt,
+        workflowState: request.status,
+        completionStage: request.completionStage,
+      };
+
+      if (hasDispatchSnapshotData(nextEntry)) {
+        nextCache[requestId] = nextEntry;
+      }
+    });
+
+    shipments.forEach((shipment) => {
+      const requestId = shipment.requestId;
+      if (!requestId) {
+        return;
+      }
+
+      const existing = nextCache[requestId];
+      const nextEntry: DispatchCacheEntry = {
+        requestId,
+        shipmentId: shipment.id || existing?.shipmentId,
+        dispatchToken: shipment.dispatchToken || existing?.dispatchToken,
+        dispatchQrPayload:
+          shipment.dispatchQrPayload ||
+          existing?.dispatchQrPayload ||
+          shipment.dispatchToken ||
+          existing?.dispatchToken,
+        dispatchQrImageUrl: shipment.dispatchQrImageUrl || existing?.dispatchQrImageUrl,
+        dispatchTokenExpiresAt: shipment.tokenExpiresAt || existing?.dispatchTokenExpiresAt,
+        workflowState: existing?.workflowState,
+        completionStage: existing?.completionStage || 'NOT_STARTED',
+      };
+
+      if (hasDispatchSnapshotData(nextEntry)) {
+        nextCache[requestId] = nextEntry;
+      }
+    });
+
+    dispatchQrCacheRef.current = nextCache;
+    writeDispatchQrCache(nextCache);
+  }, [requests, shipments]);
+
   const loadRequests = useCallback(async (options?: { silent?: boolean }) => {
     if (!options?.silent) {
       setLoading(true);
@@ -1185,6 +1452,7 @@ const RequestWorkflow = ({ view = 'combined' }: RequestWorkflowProps) => {
           (shipment) =>
             shipment.id ||
             shipment.requestId ||
+            shipment.dispatchToken ||
             shipment.dispatchQrPayload ||
             shipment.dispatchQrImageUrl
         );
@@ -1221,7 +1489,13 @@ const RequestWorkflow = ({ view = 'combined' }: RequestWorkflowProps) => {
 
       setRequests((prev) => {
         const existingById = new Map(prev.map((item) => [item.id, item]));
-        return mapped.map((item) => mergeRequestWithCachedDispatchData(item, existingById.get(item.id)));
+        return mapped.map((item) =>
+          mergeRequestWithCachedDispatchData(
+            item,
+            existingById.get(item.id),
+            dispatchQrCacheRef.current[item.id],
+          )
+        );
       });
       setShipments((prev) => {
         const existingById = new Map(prev.filter((item) => item.id).map((item) => [item.id, item]));
@@ -1231,14 +1505,14 @@ const RequestWorkflow = ({ view = 'combined' }: RequestWorkflowProps) => {
 
         const merged = mappedShipments.map((item) => {
           const cached = (item.id && existingById.get(item.id)) || (item.requestId && existingByRequest.get(item.requestId));
-          return mergeShipmentWithCachedDispatchData(item, cached);
+          return mergeShipmentWithCachedDispatchData(item, cached, item.requestId ? dispatchQrCacheRef.current[item.requestId] : undefined);
         });
 
         const mergedKeys = new Set(
           merged.map((item) => (item.id ? `id:${item.id}` : `request:${item.requestId || ''}`))
         );
         const stickyCached = prev.filter((item) => {
-          if (!item.dispatchQrPayload && !item.dispatchQrImageUrl) {
+          if (!item.dispatchToken && !item.dispatchQrPayload && !item.dispatchQrImageUrl) {
             return false;
           }
           const key = item.id ? `id:${item.id}` : `request:${item.requestId || ''}`;
@@ -1312,7 +1586,13 @@ const RequestWorkflow = ({ view = 'combined' }: RequestWorkflowProps) => {
       return null;
     }
 
-    setRequests((prev) => prev.map((entry) => (entry.id === requestId ? mergeRequestWithCachedDispatchData(mapped, entry) : entry)));
+    setRequests((prev) =>
+      prev.map((entry) =>
+        entry.id === requestId
+          ? mergeRequestWithCachedDispatchData(mapped, entry, dispatchQrCacheRef.current[requestId])
+          : entry
+      )
+    );
 
     if (mapped.latestPaymentId) {
       setLatestPaymentIdByRequest((prev) => ({
@@ -1368,6 +1648,7 @@ const RequestWorkflow = ({ view = 'combined' }: RequestWorkflowProps) => {
             (shipment) =>
               shipment.id ||
               shipment.requestId ||
+              shipment.dispatchToken ||
               shipment.dispatchQrPayload ||
               shipment.dispatchQrImageUrl
           );
@@ -1652,6 +1933,7 @@ const RequestWorkflow = ({ view = 'combined' }: RequestWorkflowProps) => {
 
     if (
       request.shipmentId ||
+      request.dispatchToken ||
       request.dispatchQrPayload ||
       request.dispatchQrImageUrl
     ) {
@@ -1659,7 +1941,7 @@ const RequestWorkflow = ({ view = 'combined' }: RequestWorkflowProps) => {
         id: request.shipmentId || '',
         requestId: request.id,
         status: request.shipmentStatus || request.status,
-        dispatchToken: undefined,
+        dispatchToken: request.dispatchToken,
         dispatchQrPayload: request.dispatchQrPayload,
         dispatchQrImageUrl: request.dispatchQrImageUrl,
         returnToken: request.returnToken,
@@ -1670,7 +1952,12 @@ const RequestWorkflow = ({ view = 'combined' }: RequestWorkflowProps) => {
   };
 
   const getDispatchQrValue = (request: MappedRequest, shipment: ShipmentInfo | null) =>
-    takeOpaqueQrPayload(request.dispatchQrPayload, shipment?.dispatchQrPayload);
+    takeOpaqueQrPayload(
+      request.dispatchQrPayload,
+      shipment?.dispatchQrPayload,
+      request.dispatchToken,
+      shipment?.dispatchToken,
+    );
 
   const getDispatchQrImageUrl = (request: MappedRequest, shipment: ShipmentInfo | null) =>
     takeToken(request.dispatchQrImageUrl, shipment?.dispatchQrImageUrl);
@@ -1822,11 +2109,13 @@ const RequestWorkflow = ({ view = 'combined' }: RequestWorkflowProps) => {
               {
                 ...entry,
                 shipmentId: dispatchSnapshot.shipmentId || entry.shipmentId,
+                dispatchToken: dispatchSnapshot.dispatchToken || entry.dispatchToken,
                 dispatchQrPayload: dispatchSnapshot.dispatchQrPayload || entry.dispatchQrPayload,
                 dispatchQrImageUrl: dispatchSnapshot.dispatchQrImageUrl || entry.dispatchQrImageUrl,
                 dispatchTokenExpiresAt: dispatchSnapshot.dispatchTokenExpiresAt || entry.dispatchTokenExpiresAt,
               },
               entry,
+              dispatchQrCacheRef.current[request.id],
             );
           })
         );
@@ -1844,8 +2133,11 @@ const RequestWorkflow = ({ view = 'combined' }: RequestWorkflowProps) => {
 
       const latestDispatchQrPayload = takeOpaqueQrPayload(
         dispatchSnapshot?.dispatchQrPayload,
+        dispatchSnapshot?.dispatchToken,
         shipmentAfterDispatch?.dispatchQrPayload,
+        shipmentAfterDispatch?.dispatchToken,
         detailAfterDispatch?.dispatchQrPayload,
+        detailAfterDispatch?.dispatchToken,
       );
 
       toast({
@@ -2694,7 +2986,7 @@ const RequestWorkflow = ({ view = 'combined' }: RequestWorkflowProps) => {
                                 variant="outline"
                                 disabled={dispatchQrExpired}
                                 onClick={() => {
-                                  const ok = printQrSection(printableSectionId, 'Dispatch QR');
+                                  const ok = printQrSection(printableSectionId, 'Dispatch QR', Math.max(qrPixelSize, 420));
                                   if (!ok) {
                                     toast({ title: 'Print unavailable', description: 'Unable to open printable QR preview.', variant: 'destructive' });
                                   }
@@ -3051,6 +3343,11 @@ const RequestWorkflow = ({ view = 'combined' }: RequestWorkflowProps) => {
                               size="sm"
                               variant="outline"
                               onClick={() => {
+                                try {
+                                  window.sessionStorage.setItem(DISPATCH_SCAN_REQUEST_CONTEXT_KEY, request.id);
+                                } catch {
+                                  // Ignore storage errors.
+                                }
                                 window.location.assign(`/dispatch/scan?requestId=${encodeURIComponent(request.id)}`);
                               }}
                             >

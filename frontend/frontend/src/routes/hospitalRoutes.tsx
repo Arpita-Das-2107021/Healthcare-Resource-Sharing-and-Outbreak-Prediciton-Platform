@@ -110,6 +110,8 @@ const PERMISSIONS = {
   paymentCheckout: ['hospital:payment.view', 'hospital:payment.initiate'],
   paymentOps: ['hospital:payment.view'],
   paymentReconcile: ['hospital:payment.reconcile.manage'],
+  refundInitiate: ['hospital:payment.refund.initiate'],
+  refundConfirm: ['hospital:payment.refund.confirm'],
   mlOperations: PLATFORM_ML_OPERATIONS_PERMISSIONS,
   mlInsights: PLATFORM_ML_INSIGHTS_PERMISSIONS,
   reports: ['reports:view', 'hospital:analytics.view', 'platform:audit.view'],

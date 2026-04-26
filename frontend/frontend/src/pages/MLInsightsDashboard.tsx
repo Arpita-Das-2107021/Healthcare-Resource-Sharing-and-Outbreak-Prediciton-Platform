@@ -19,6 +19,7 @@ import { useToast } from '@/hooks/use-toast';
 import { Loader2 } from 'lucide-react';
 
 interface SuggestionRow {
+  source: string;
   facility_id: string;
   distance_km: number;
   available_quantity: number;
@@ -81,16 +82,19 @@ const MLInsightsDashboard = () => {
       if (suggestionsRes.status === 'fulfilled') {
         const root = asRecord(suggestionsRes.value);
         const data = asRecord(root.data);
-        const list = asArray(data.results ?? data.suggestions ?? root.results ?? root.suggestions ?? suggestionsRes.value);
+        const list = asArray(data.items);
         setSuggestions(
-          list.map((item) => {
-            const row = asRecord(item);
-            return {
-              facility_id: String(row.facility_id ?? row.hospital_id ?? row.id ?? ''),
-              distance_km: toNumber(row.distance_km ?? row.distance ?? 0),
-              available_quantity: toNumber(row.available_quantity ?? row.quantity ?? 0),
-            };
-          }).filter((row) => row.facility_id)
+          list
+            .map((item) => {
+              const row = asRecord(item);
+              return {
+                source: String(row.source ?? '').trim(),
+                facility_id: String(row.facility_id ?? '').trim(),
+                distance_km: toNumber(row.distance_km ?? 0),
+                available_quantity: toNumber(row.available_quantity ?? 0),
+              };
+            })
+            .filter((row) => row.facility_id),
         );
       } else {
         setSuggestions([]);
@@ -183,6 +187,7 @@ const MLInsightsDashboard = () => {
               <Table>
                 <TableHeader>
                   <TableRow>
+                    <TableHead>Source</TableHead>
                     <TableHead>Facility ID</TableHead>
                     <TableHead>Distance (km)</TableHead>
                     <TableHead>Available Qty</TableHead>
@@ -190,8 +195,9 @@ const MLInsightsDashboard = () => {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {suggestions.map((row) => (
-                    <TableRow key={`${row.facility_id}-${row.distance_km}-${row.available_quantity}`}>
+                  {suggestions.map((row, index) => (
+                    <TableRow key={`${row.facility_id}-${row.source}-${index}`}>
+                      <TableCell className="text-xs text-muted-foreground">{row.source || '—'}</TableCell>
                       <TableCell className="font-mono text-xs">{row.facility_id}</TableCell>
                       <TableCell>{row.distance_km}</TableCell>
                       <TableCell>{row.available_quantity}</TableCell>

@@ -337,7 +337,12 @@ def get_training_job(actor, training_job_id) -> dict:
 
 
 def process_training_callback(payload: dict, headers: dict, signature_payload: dict | None = None) -> dict:
-    request_id = _ensure_callback_headers(payload, headers, signature_payload=signature_payload)
+    request_id = _ensure_callback_headers(
+        payload,
+        headers,
+        signature_payload=signature_payload,
+        allow_legacy_hmac=True,
+    )
 
     with transaction.atomic():
         job = _training_job_or_404(payload["training_job_id"])

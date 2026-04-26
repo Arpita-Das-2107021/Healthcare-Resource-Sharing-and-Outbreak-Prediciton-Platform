@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import AppLayout from '@/components/layout/AppLayout';
 import DispatchQrScanner from '@/components/dispatch/DispatchQrScanner';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -25,12 +25,26 @@ import {
 } from '@/utils/deliveryConfirmation';
 import { Camera, Loader2, QrCode, RefreshCcw, ShieldCheck } from 'lucide-react';
 
+const DISPATCH_SCAN_REQUEST_CONTEXT_KEY = 'dispatch-scan:request-id';
+
 const ScanDispatchQRCode = () => {
   const { toast } = useToast();
   const requestedRequestId = useMemo(() => {
     const params = new URLSearchParams(window.location.search);
     return (params.get('requestId') || '').trim();
   }, []);
+
+  const [requestContextId, setRequestContextId] = useState(() => {
+    if (requestedRequestId) {
+      return requestedRequestId;
+    }
+
+    try {
+      return (window.sessionStorage.getItem(DISPATCH_SCAN_REQUEST_CONTEXT_KEY) || '').trim();
+    } catch {
+      return '';
+    }
+  });
 
   const [scanSession, setScanSession] = useState(0);
   const [scannerActive, setScannerActive] = useState(true);
@@ -43,6 +57,39 @@ const ScanDispatchQRCode = () => {
   >(null);
   const [verifying, setVerifying] = useState(false);
   const [verificationLocked, setVerificationLocked] = useState(false);
+
+  const effectiveRequestId = requestContextId.trim();
+
+  const persistRequestContext = useCallback((requestId: string) => {
+    const trimmed = requestId.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    try {
+      window.sessionStorage.setItem(DISPATCH_SCAN_REQUEST_CONTEXT_KEY, trimmed);
+    } catch {
+      // Ignore storage errors.
+    }
+  }, []);
+
+  const clearPersistedRequestContext = useCallback(() => {
+    try {
+      window.sessionStorage.removeItem(DISPATCH_SCAN_REQUEST_CONTEXT_KEY);
+    } catch {
+      // Ignore storage errors.
+    }
+  }, []);
+
+  const handleRequestContextInputChange = (value: string) => {
+    setRequestContextId(value);
+    const trimmed = value.trim();
+    if (trimmed) {
+      persistRequestContext(trimmed);
+      return;
+    }
+    clearPersistedRequestContext();
+  };
 
   const handleScan = useCallback((value: string) => {
     if (verifying || verificationLocked) {
@@ -73,7 +120,7 @@ const ScanDispatchQRCode = () => {
     if (!scannedValue || verifying || verificationLocked) return;
 
     try {
-      const requestId = requestedRequestId;
+      const requestId = effectiveRequestId;
 
       const validation = validateTransferConfirmInput(scannedValue, 1);
 
@@ -84,6 +131,8 @@ const ScanDispatchQRCode = () => {
       if (!requestId) {
         throw new Error('Request context is missing. Open scanner from a request card to submit transfer confirmation.');
       }
+
+      persistRequestContext(requestId);
 
       setPendingCompletion({
         requestId,
@@ -131,6 +180,13 @@ const ScanDispatchQRCode = () => {
       setVerifying(false);
     }
   };
+
+  useEffect(() => {
+    if (!requestedRequestId) {
+      return;
+    }
+    persistRequestContext(requestedRequestId);
+  }, [persistRequestContext, requestedRequestId]);
 
   return (
     <AppLayout title="Dispatch QR Scanner"
@@ -191,6 +247,21 @@ const ScanDispatchQRCode = () => {
             <CardDescription>Scanned QR content is treated as opaque payload and forwarded unchanged.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
+            <div className="space-y-2">
+              <p className="text-xs text-muted-foreground">Request context (required)</p>
+              <Input
+                value={requestContextId}
+                onChange={(event) => handleRequestContextInputChange(event.target.value)}
+                placeholder="Request ID (for example: req-123)"
+                disabled={verifying || verificationLocked}
+              />
+              {!effectiveRequestId ? (
+                <p className="text-xs text-warning">
+                  Request ID is required for transfer confirmation. Open scanner from a request card or paste request ID manually.
+                </p>
+              ) : null}
+            </div>
+
             {!scannedValue ? (
               <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
                 No QR value scanned yet.

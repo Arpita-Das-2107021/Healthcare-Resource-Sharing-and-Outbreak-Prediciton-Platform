@@ -1,6 +1,6 @@
-"""
+﻿"""
 Phase 1 — Data Generator
-Generates random healthcare sales data for Bangladesh (Joypurhat district).
+Generates random facility sales data for Bangladesh (Joypurhat district).
 Edit the CSV files later with real data.
 """
 
@@ -11,35 +11,35 @@ import os
 
 random.seed(42)
 
-# ── 1. Healthcares ──────────────────────────────────────────────────────────────
-# 20 healthcares spread across Joypurhat district, Bangladesh
+# ── 1. Facilities ──────────────────────────────────────────────────────────────
+# 20 facilities spread across Joypurhat district, Bangladesh
 HEALTHCARES = [
-    {"healthcare_id": f"PH{i:03d}",
+    {"facility_id": f"PH{i:03d}",
      "name": name,
      "upazila": upazila,
      "lat": lat + random.uniform(-0.01, 0.01),
      "lon": lon + random.uniform(-0.01, 0.01)}
     for i, (name, upazila, lat, lon) in enumerate([
-        ("Asha Healthcare",         "Joypurhat Sadar", 24.898, 89.017),
+        ("Asha Facility",         "Joypurhat Sadar", 24.898, 89.017),
         ("Al-Amin Drug House",    "Joypurhat Sadar", 24.902, 89.021),
         ("Noor Medicine Corner",  "Joypurhat Sadar", 24.895, 89.013),
-        ("Rahman Healthcare",       "Joypurhat Sadar", 24.890, 89.025),
+        ("Rahman Facility",       "Joypurhat Sadar", 24.890, 89.025),
         ("City Drug Store",       "Joypurhat Sadar", 24.907, 89.008),
         ("Akbar Medicine",        "Akkelpur",        24.956, 89.045),
-        ("Green Cross Healthcare",  "Akkelpur",        24.961, 89.052),
+        ("Green Cross Facility",  "Akkelpur",        24.961, 89.052),
         ("Sathi Drug House",      "Akkelpur",        24.950, 89.038),
-        ("Bismillah Healthcare",    "Kalai",            25.017, 89.063),
-        ("Popular Healthcare",      "Kalai",            25.022, 89.058),
+        ("Bismillah Facility",    "Kalai",            25.017, 89.063),
+        ("Popular Facility",      "Kalai",            25.022, 89.058),
         ("Hasan Medicine",        "Kalai",            25.011, 89.071),
-        ("New Life Healthcare",     "Khetlal",          24.988, 89.115),
+        ("New Life Facility",     "Khetlal",          24.988, 89.115),
         ("Moon Drug Store",       "Khetlal",          24.981, 89.120),
-        ("Rupali Healthcare",       "Khetlal",          24.994, 89.108),
+        ("Rupali Facility",       "Khetlal",          24.994, 89.108),
         ("Al-Shifa Medicine",     "Panchbibi",        25.050, 89.150),
         ("Taher Drug House",      "Panchbibi",        25.055, 89.143),
-        ("Health Plus Healthcare",  "Panchbibi",        25.044, 89.158),
+        ("Health Plus Facility",  "Panchbibi",        25.044, 89.158),
         ("Mamun Medicine Corner", "Panchbibi",        25.060, 89.136),
-        ("Riya Healthcare",         "Joypurhat Sadar",  24.885, 89.030),
-        ("Trust Healthcare",        "Akkelpur",         24.968, 89.041),
+        ("Riya Facility",         "Joypurhat Sadar",  24.885, 89.030),
+        ("Trust Facility",        "Akkelpur",         24.968, 89.041),
     ], start=0)
 ]
 
@@ -64,7 +64,7 @@ MEDICINES = [
 ]
 
 # ── 3. Simulate a dengue + flu outbreak ──────────────────────────────────────
-# Dengue hits Joypurhat Sadar healthcares in week 3
+# Dengue hits Joypurhat Sadar facilities in week 3
 # Flu hits Akkelpur in week 4
 OUTBREAKS = [
     {"disease": "Dengue",     "start_day": 15, "end_day": 40,
@@ -78,10 +78,10 @@ OUTBREAKS = [
      "medicines": ["ORS Sachet", "Metronidazole 400mg", "Zinc 20mg (child)", "Ciprofloxacin 500mg"]},
 ]
 
-def get_multiplier(healthcare, medicine_name, day):
-    """Return sales multiplier if an outbreak affects this healthcare/medicine."""
+def get_multiplier(facility, medicine_name, day):
+    """Return sales multiplier if an outbreak affects this facility/medicine."""
     for ob in OUTBREAKS:
-        if (healthcare["upazila"] in ob["upazilas"]
+        if (facility["upazila"] in ob["upazilas"]
                 and medicine_name in ob["medicines"]
                 and ob["start_day"] <= day <= ob["end_day"]):
             # ramp up, peak, ramp down
@@ -110,7 +110,7 @@ for day in range(NUM_DAYS):
                 continue
             sales_rows.append({
                 "date":          date,
-                "healthcare_id":   ph["healthcare_id"],
+                "facility_id":   ph["facility_id"],
                 "medicine_name": med_name,
                 "quantity_sold": qty,
                 "upazila":       ph["upazila"],
@@ -119,15 +119,15 @@ for day in range(NUM_DAYS):
 # ── 5. Write files ────────────────────────────────────────────────────────────
 out = os.path.dirname(__file__)
 
-with open(f"{out}/healthcares.csv", "w", newline="") as f:
-    w = csv.DictWriter(f, fieldnames=["healthcare_id","name","upazila","lat","lon"])
+with open(f"{out}/facilities.csv", "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=["facility_id","name","upazila","lat","lon"])
     w.writeheader(); w.writerows(HEALTHCARES)
-print(f"✓ healthcares.csv  — {len(HEALTHCARES)} healthcares")
+print(f"✓ facilities.csv  — {len(HEALTHCARES)} facilities")
 
 with open(f"{out}/sales.csv", "w", newline="") as f:
-    w = csv.DictWriter(f, fieldnames=["date","healthcare_id","medicine_name","quantity_sold","upazila"])
+    w = csv.DictWriter(f, fieldnames=["date","facility_id","medicine_name","quantity_sold","upazila"])
     w.writeheader(); w.writerows(sales_rows)
-print(f"✓ sales.csv       — {len(sales_rows):,} records ({NUM_DAYS} days × {len(HEALTHCARES)} healthcares)")
+print(f"✓ sales.csv       — {len(sales_rows):,} records ({NUM_DAYS} days × {len(HEALTHCARES)} facilities)")
 
 with open(f"{out}/medicines.csv", "w", newline="") as f:
     w = csv.DictWriter(f, fieldnames=["medicine_name","base_daily_sales","outbreak_multiplier","signals_disease"])
@@ -144,3 +144,5 @@ with open(f"{out}/outbreaks_ground_truth.csv", "w", newline="") as f:
                     "upazilas":  "|".join(ob["upazilas"]),
                     "medicines": "|".join(ob["medicines"])})
 print(f"✓ outbreaks_ground_truth.csv  — {len(OUTBREAKS)} simulated outbreaks")
+
+

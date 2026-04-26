@@ -13,6 +13,9 @@ import { requestsApi } from '@/services/api';
 import { useAuth } from '@/contexts/AuthContext';
 import { useToast } from '@/hooks/use-toast';
 import { RESOURCE_SHARES_UPDATED_EVENT } from '@/constants/events';
+import { hasAnyPermission } from '@/lib/rbac';
+import { REFUND_STATUS } from '@/types/refund';
+import ReturnVerificationDialog from '@/components/request/ReturnVerificationDialog';
 
 interface RequestRow {
   id: string;
@@ -23,6 +26,7 @@ interface RequestRow {
   requestedAt: string;
   quantityRequested: number;
   quantityApproved: number | null;
+  quantityTransferred: number | null;
   priceSnapshot: number | null;
   totalPrice: number | null;
   status: string;
@@ -53,6 +57,7 @@ const mapRequest = (item: unknown): RequestRow => ({
   requestedAt: String(item.created_at || item.requested_at || item.requestedAt || item.submitted_at || item.updated_at || ''),
   quantityRequested: Number(item.quantity_requested ?? 0),
   quantityApproved: normalizeNumber(item.quantity_approved),
+  quantityTransferred: normalizeNumber(item.quantity_transferred),
   priceSnapshot: normalizeNumber(item.price_snapshot),
   totalPrice: normalizeNumber(item.total_price),
   status: String(item.workflow_state || item.status || 'PENDING'),
@@ -64,6 +69,54 @@ const mapRequest = (item: unknown): RequestRow => ({
 });
 
 const currency = (value: number | null) => (value === null ? '-' : value.toLocaleString());
+
+const PERM_VERIFY_RETURN = 'share.request.approve';
+
+interface VerifyReturnActionProps {
+  requestId: string;
+  quantityTransferred: number | null;
+}
+
+const VerifyReturnAction = ({ requestId, quantityTransferred }: VerifyReturnActionProps) => {
+  const { user } = useAuth();
+  const [showDialog, setShowDialog] = useState(false);
+
+  const canVerify = hasAnyPermission(user, [PERM_VERIFY_RETURN]);
+
+  const { data: raw } = useQuery({
+    queryKey: ['refund-status', requestId],
+    queryFn: () => requestsApi.getRefundStatus(requestId),
+    retry: 1,
+    enabled: canVerify,
+  });
+
+  if (!canVerify) return null;
+
+  const root = raw as Record<string, unknown> | null | undefined;
+  const data = root?.data ?? raw;
+  const refundStatus = data && typeof data === 'object'
+    ? (data as Record<string, unknown>).refund_status as string | undefined
+    : undefined;
+
+  if (refundStatus !== REFUND_STATUS.PENDING_RETURN_VERIFICATION) return null;
+
+  return (
+    <div className="mt-2">
+      {!showDialog ? (
+        <Button size="sm" variant="outline" onClick={() => setShowDialog(true)}>
+          Verify Return
+        </Button>
+      ) : (
+        <ReturnVerificationDialog
+          requestId={requestId}
+          quantityTransferred={quantityTransferred}
+          onSuccess={() => setShowDialog(false)}
+          onClose={() => setShowDialog(false)}
+        />
+      )}
+    </div>
+  );
+};
 
 const IncomingRequests = () => {
   const { user } = useAuth();
@@ -104,6 +157,7 @@ const IncomingRequests = () => {
       queryClient.invalidateQueries({ queryKey: ['outgoing-requests'] }),
       queryClient.invalidateQueries({ queryKey: ['shared-resources-list'] }),
       queryClient.invalidateQueries({ queryKey: ['inventory-list'] }),
+      queryClient.invalidateQueries({ queryKey: ['retail-inventory'] }),
     ]);
     window.dispatchEvent(new Event(RESOURCE_SHARES_UPDATED_EVENT));
   }, [queryClient]);
@@ -242,6 +296,10 @@ const IncomingRequests = () => {
                             ) : (
                               <span className="text-xs text-muted-foreground">No action available</span>
                             )}
+                            <VerifyReturnAction
+                              requestId={item.id}
+                              quantityTransferred={item.quantityTransferred}
+                            />
                           </TableCell>
                         </TableRow>
                       );

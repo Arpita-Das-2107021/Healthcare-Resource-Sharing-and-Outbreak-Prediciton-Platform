@@ -1,4 +1,4 @@
-"""
+﻿"""
 Phase 3 — ST-GNN Training (Disease Outbreak Prediction)
 Implements a simplified Spatiotemporal GNN inspired by:
   - Paper 3 (DGO-ST-GNN): stacked ST-Conv blocks
@@ -6,10 +6,10 @@ Implements a simplified Spatiotemporal GNN inspired by:
   - Paper 1 (VRE GNN):    temporal graph sequences
 
 Architecture:
-  Input: 7-day sequence of healthcare graph snapshots
+  Input: 7-day sequence of facility graph snapshots
   → GraphConv layers (spatial)
   → GRU (temporal)
-  → Fully connected → outbreak probability per healthcare-node
+  → Fully connected → outbreak probability per facility-node
 
 Requirements: pip install torch torch-geometric numpy
 """
@@ -186,23 +186,23 @@ def train():
 
     # ── Show predictions for the last day ────────────────────────────────────
     print("\nPredictions for the LAST snapshot:")
-    print(f"{'Healthcare':<12} {'Upazila':<20} {'P(outbreak)':<14} {'True label'}")
+    print(f"{'Facility':<12} {'Upazila':<20} {'P(outbreak)':<14} {'True label'}")
     print("─" * 60)
 
     last_seq = test_seq[-1]
     X, y, adj = last_seq
     pred = model.forward(X, adj)
 
-    # Load healthcare info for display
+    # Load facility info for display
     import csv
-    healthcares = {}
-    ph_csv = os.path.join(os.path.dirname(__file__), "../data/healthcares.csv")
+    facilities = {}
+    ph_csv = os.path.join(os.path.dirname(__file__), "../data/facilities.csv")
     with open(ph_csv) as f:
         for row in csv.DictReader(f):
-            healthcares[row["healthcare_id"]] = row
+            facilities[row["facility_id"]] = row
 
     for i, ph_id in enumerate(node_ids):
-        ph    = healthcares.get(ph_id, {})
+        ph    = facilities.get(ph_id, {})
         label = "⚠ OUTBREAK" if y[i] == 1 else "Normal"
         flag  = "  ← ALERT" if pred[i] > 0.5 and y[i] == 1 else (
                 "  ← FALSE ALARM" if pred[i] > 0.5 and y[i] == 0 else "")
@@ -265,3 +265,5 @@ class STGNN(nn.Module):
 #         loss.backward()
 #         optimizer.step()
 """
+
+

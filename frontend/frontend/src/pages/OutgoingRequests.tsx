@@ -13,6 +13,7 @@ import { requestsApi } from '@/services/api';
 import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
 import { RESOURCE_SHARES_UPDATED_EVENT } from '@/constants/events';
+import RefundActionButtons from '@/components/request/RefundActionButtons';
 
 interface RequestRow {
   id: string;
@@ -96,6 +97,7 @@ const OutgoingRequests = () => {
       queryClient.invalidateQueries({ queryKey: ['incoming-requests'] }),
       queryClient.invalidateQueries({ queryKey: ['shared-resources-list'] }),
       queryClient.invalidateQueries({ queryKey: ['inventory-list'] }),
+      queryClient.invalidateQueries({ queryKey: ['retail-inventory'] }),
     ]);
     window.dispatchEvent(new Event(RESOURCE_SHARES_UPDATED_EVENT));
   }, [queryClient]);
@@ -184,12 +186,13 @@ const OutgoingRequests = () => {
                   <TableHead>Needed By</TableHead>
                   <TableHead>Priority</TableHead>
                   <TableHead>Actions</TableHead>
+                  <TableHead>Refund</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {outgoingRequests.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={10} className="text-center text-muted-foreground">
+                    <TableCell colSpan={11} className="text-center text-muted-foreground">
                       No outgoing requests.
                     </TableCell>
                   </TableRow>
@@ -262,6 +265,16 @@ const OutgoingRequests = () => {
                               Cancel
                             </Button>
                           </div>
+                        </TableCell>
+                        <TableCell className="min-w-52 align-top">
+                          <RefundActionButtons
+                            requestId={item.id}
+                            requestSummary={{
+                              resource: item.resource,
+                              supplierHospital: item.supplierHospital,
+                              totalPrice: item.totalPrice,
+                            }}
+                          />
                         </TableCell>
                       </TableRow>
                     );

@@ -16,12 +16,15 @@ class Settings:
     callback_timeout_seconds: int = int(os.getenv("CALLBACK_TIMEOUT_SECONDS", "10"))
     callback_max_retries: int = int(os.getenv("CALLBACK_MAX_RETRIES", "3"))
 
-    outbreak_model_path: str = os.getenv("OUTBREAK_MODEL_PATH", "model2/models/stgnn_model.pt")
+    outbreak_model_path: str = os.getenv(
+        "OUTBREAK_MODEL_PATH",
+        "final_outbreak_model/models/stgnn_model.pt",
+    )
     graph_radius: float = float(os.getenv("GRAPH_RADIUS", "10"))
     sequence_length: int = int(os.getenv("SEQUENCE_LENGTH", "7"))
 
     # Folder containing static CSV dependencies for outbreak pipeline.
-    base_data_dir: str = os.getenv("OUTBREAK_BASE_DATA_DIR", "model2/data")
+    base_data_dir: str = os.getenv("OUTBREAK_BASE_DATA_DIR", "final_outbreak_model/data")
 
 
 settings = Settings()

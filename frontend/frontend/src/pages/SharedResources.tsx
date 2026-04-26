@@ -124,6 +124,11 @@ const isClosedStatus = (status: string): boolean => {
   ].includes(normalized);
 };
 
+const isTerminalShareStatus = (status: string): boolean => {
+  const normalized = normalizeStatus(status);
+  return ['closed', 'inactive', 'expired', 'cancelled', 'canceled', 'rejected', 'failed', 'deleted'].includes(normalized);
+};
+
 const normalizeNumber = (value: unknown): number | null => {
   if (value === null || value === undefined || value === '') return null;
   const parsed = Number(value);
@@ -148,45 +153,68 @@ const resolveShareQuantities = (
       ? (item.share_visibility as Record<string, unknown>)
       : {};
 
-  const sharedQuantity = readNonNegativeNumber(
-    item.quantity_offered,
+  const configuredSharedQuantity = readNonNegativeNumber(
+    item.configured_quantity_offered,
     item.shared_quantity,
     item.total_shared_quantity,
-    shareVisibility.quantity_offered,
     shareVisibility.shared_quantity,
-    item.quantity
+    shareVisibility.configured_quantity_offered,
+    item.quantity_shared
   );
 
+  // For discoverability endpoints, quantity_offered mirrors available_share_quantity.
   const availableQuantity = readNonNegativeNumber(
-    item.available_shared_quantity,
     item.available_share_quantity,
+    item.available_shared_quantity,
+    item.quantity_offered,
+    shareVisibility.available_share_quantity,
+    shareVisibility.available_shared_quantity,
+    shareVisibility.quantity_offered,
     item.remaining_shared_quantity,
     item.remaining_share_quantity,
     item.quantity_available_for_share,
-    item.quantity_remaining_for_share,
-    shareVisibility.available_shared_quantity,
-    shareVisibility.available_share_quantity,
-    shareVisibility.remaining_shared_quantity,
-    shareVisibility.remaining_share_quantity
+    item.quantity_remaining_for_share
+  );
+
+  const reservedQuantity = readNonNegativeNumber(
+    item.reserved_quantity,
+    item.quantity_reserved,
+    shareVisibility.reserved_quantity,
+    shareVisibility.quantity_reserved
+  );
+
+  const transferredQuantity = readNonNegativeNumber(
+    item.transferred_quantity,
+    item.quantity_transferred,
+    shareVisibility.transferred_quantity,
+    shareVisibility.quantity_transferred
   );
 
   const committedQuantity = readNonNegativeNumber(
-    item.committed_request_count,
     item.committed_quantity,
-    item.reserved_quantity,
-    shareVisibility.committed_request_count,
-    shareVisibility.committed_quantity,
-    shareVisibility.reserved_quantity
+    shareVisibility.committed_quantity
   );
 
-  const resolvedSharedQuantity = sharedQuantity ?? availableQuantity ?? 0;
+  const derivedCommittedQuantity =
+    committedQuantity ??
+    (reservedQuantity !== null || transferredQuantity !== null
+      ? (reservedQuantity ?? 0) + (transferredQuantity ?? 0)
+      : null);
+
+  const resolvedSharedQuantity =
+    configuredSharedQuantity ??
+    (availableQuantity !== null && derivedCommittedQuantity !== null
+      ? availableQuantity + derivedCommittedQuantity
+      : availableQuantity ?? 0);
+
   const resolvedAvailableQuantity =
     availableQuantity ??
-    (committedQuantity !== null
-      ? Math.max(0, resolvedSharedQuantity - committedQuantity)
+    (derivedCommittedQuantity !== null
+      ? Math.max(0, resolvedSharedQuantity - derivedCommittedQuantity)
       : resolvedSharedQuantity);
+
   const resolvedCommittedQuantity =
-    committedQuantity ?? Math.max(0, resolvedSharedQuantity - resolvedAvailableQuantity);
+    derivedCommittedQuantity ?? Math.max(0, resolvedSharedQuantity - resolvedAvailableQuantity);
 
   return {
     sharedQuantity: resolvedSharedQuantity,
@@ -217,13 +245,23 @@ const mapShare = (value: unknown): ShareRow => {
   const hospital = asRecord(item.hospital);
   const quantityMetrics = resolveShareQuantities(item);
 
+  const hospitalId =
+    readIdFromUnknown(item.hospital) ||
+    readIdFromUnknown(item.hospital_id) ||
+    readIdFromUnknown(item.offering_hospital) ||
+    readIdFromUnknown(item.offering_hospital_id);
+
+  const catalogItemId =
+    readIdFromUnknown(item.catalog_item) ||
+    readIdFromUnknown(item.catalog_item_id);
+
   return {
     id: String(item.id || item.share_id || item.resource_share_id || item.share_record_id || ''),
-    hospitalId: String(item.hospital || item.hospital_id || item.offering_hospital || item.offering_hospital_id || ''),
+    hospitalId,
     hospitalName: readString(item, ['hospital_name', 'offering_hospital_name'], readString(hospital, ['name'])),
-    catalogItemId: String(item.catalog_item || item.catalog_item_id || ''),
+    catalogItemId,
     resourceName: String(item.catalog_item_name || item.resource_name || item.product_name || 'Resource'),
-    resourceType: normalizeType(item.resource_type || item.catalog_item_type || item.type),
+    resourceType: normalizeType(item.resource_type_name || item.resource_type || item.catalog_item_resource_type_name || item.catalog_item_type || item.type),
     resourceTypeName: String(item.resource_type_name || item.catalog_item_resource_type_name || 'General'),
     sharedQuantity: quantityMetrics.sharedQuantity,
     quantityOffered: quantityMetrics.availableQuantity,
@@ -318,6 +356,7 @@ const toCardResource = (share: ShareRow): ResourceWithVisibility => {
     id: share.id,
     name: share.resourceName,
     type: share.resourceType,
+    resourceTypeName: share.resourceTypeName,
     hospital: share.hospitalName || 'Partner hospital',
     quantity: share.quantityOffered,
     availability,
@@ -398,8 +437,7 @@ const SharedResources = () => {
 
   const discoverableShares = useMemo(() => {
     return (sharesQuery.data || []).filter((item) => {
-      const status = item.status.toLowerCase();
-      if (status !== 'active' || item.quantityOffered <= 0) return false;
+      if (isTerminalShareStatus(item.status) || item.quantityOffered <= 0) return false;
 
       const isMyHospitalShare = Boolean(myHospitalId) && item.hospitalId === myHospitalId;
       if (isMyHospitalShare) return false;
@@ -408,7 +446,8 @@ const SharedResources = () => {
       if (categoryFilter !== 'all' && item.resourceTypeName !== categoryFilter) return false;
 
       if (!item.validUntil) return true;
-      return new Date(item.validUntil).getTime() > Date.now();
+      const validUntilEpoch = new Date(item.validUntil).getTime();
+      return Number.isNaN(validUntilEpoch) || validUntilEpoch > Date.now();
     });
   }, [sharesQuery.data, myHospitalId, hospitalFilter, typeFilter, categoryFilter]);
 

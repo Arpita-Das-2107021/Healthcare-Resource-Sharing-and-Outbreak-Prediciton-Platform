@@ -64,18 +64,14 @@ def create_json_inference_job(actor, *, model_key: str, validated_data: dict, id
     facility = _resolve_inference_facility(actor, validated_data.get("facility_id"))
     _ensure_active_job_limit(facility, job_type)
 
-    base_parameters = dict(validated_data.get("parameters") or {})
-    base_parameters["prediction_horizon_days"] = int(validated_data.get("prediction_horizon_days") or 1)
-    if model_key == "model2":
-        base_parameters["max_neighbors"] = int(validated_data.get("max_neighbors") or 20)
-
     job_parameters = {
-        **base_parameters,
+        "prediction_horizon_days": int(validated_data.get("prediction_horizon_days") or 1),
         "_execution_mode": "json_inference",
         "_model_key": model_key,
         "inference_input": validated_data.get("input") or {},
-        "inference_context": validated_data.get("context") or {},
     }
+    if model_key == "model2":
+        job_parameters["max_neighbors"] = int(validated_data.get("max_neighbors") or 20)
 
     normalized_payload = _normalize_job_payload(
         {

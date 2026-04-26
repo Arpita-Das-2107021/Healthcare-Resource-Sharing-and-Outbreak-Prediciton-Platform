@@ -10,14 +10,14 @@ services:
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
       MINIO_SECURE: ${MINIO_SECURE:-false}
-      CALLBACK_SIGNATURE_SECRET: ${CALLBACK_SIGNATURE_SECRET:-dev-secret}
+      CALLBACK_SIGNATURE_SECRET: ${CALLBACK_SIGNATURE_SECRET:-change-me-server-b-callback-secret}
       MINIO_FORECAST_BUCKET: ${MINIO_FORECAST_BUCKET:-ml-forecast}
       MINIO_OUTBREAK_BUCKET: ${MINIO_OUTBREAK_BUCKET:-ml-outbreak}
-      OUTBREAK_MODEL_PATH: ${OUTBREAK_MODEL_PATH:-model2/models/stgnn_model.pt}
+      OUTBREAK_MODEL_PATH: ${OUTBREAK_MODEL_PATH:-final_outbreak_model/models/stgnn_model.pt}
       GRAPH_RADIUS: ${GRAPH_RADIUS:-10}
       SEQUENCE_LENGTH: ${SEQUENCE_LENGTH:-7}
       BASE_DATA_DIR: ${BASE_DATA_DIR:-.}
-      OUTBREAK_BASE_DATA_DIR: ${OUTBREAK_BASE_DATA_DIR:-model2/data}
+      OUTBREAK_BASE_DATA_DIR: ${OUTBREAK_BASE_DATA_DIR:-final_outbreak_model/data}
       MODEL1_ARTIFACT_DIR: ${MODEL1_ARTIFACT_DIR:-/app/model1_artifacts}
       MODEL2_ARTIFACT_DIR: ${MODEL2_ARTIFACT_DIR:-/app/model2_artifacts}
     volumes:
@@ -36,7 +36,7 @@ services:
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
       MINIO_SECURE: ${MINIO_SECURE:-false}
-      CALLBACK_SIGNATURE_SECRET: ${CALLBACK_SIGNATURE_SECRET:-dev-secret}
+      CALLBACK_SIGNATURE_SECRET: ${CALLBACK_SIGNATURE_SECRET:-change-me-server-b-callback-secret}
       MINIO_FORECAST_BUCKET: ${MINIO_FORECAST_BUCKET:-ml-forecast}
       BASE_DATA_DIR: ${BASE_DATA_DIR:-.}
       MODEL1_ARTIFACT_DIR: ${MODEL1_ARTIFACT_DIR:-/app/model1_artifacts}
@@ -54,12 +54,12 @@ services:
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
       MINIO_SECURE: ${MINIO_SECURE:-false}
-      CALLBACK_SIGNATURE_SECRET: ${CALLBACK_SIGNATURE_SECRET:-dev-secret}
+      CALLBACK_SIGNATURE_SECRET: ${CALLBACK_SIGNATURE_SECRET:-change-me-server-b-callback-secret}
       MINIO_OUTBREAK_BUCKET: ${MINIO_OUTBREAK_BUCKET:-ml-outbreak}
-      OUTBREAK_MODEL_PATH: ${OUTBREAK_MODEL_PATH:-model2/models/stgnn_model.pt}
+      OUTBREAK_MODEL_PATH: ${OUTBREAK_MODEL_PATH:-final_outbreak_model/models/stgnn_model.pt}
       GRAPH_RADIUS: ${GRAPH_RADIUS:-10}
       SEQUENCE_LENGTH: ${SEQUENCE_LENGTH:-7}
-      OUTBREAK_BASE_DATA_DIR: ${OUTBREAK_BASE_DATA_DIR:-model2/data}
+      OUTBREAK_BASE_DATA_DIR: ${OUTBREAK_BASE_DATA_DIR:-final_outbreak_model/data}
       MODEL2_ARTIFACT_DIR: ${MODEL2_ARTIFACT_DIR:-/app/model2_artifacts}
     volumes:
       - server_b_model2_artifacts:/app/model2_artifacts
@@ -73,14 +73,14 @@ services:
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
       MINIO_SECURE: ${MINIO_SECURE:-false}
-      CALLBACK_SIGNATURE_SECRET: ${CALLBACK_SIGNATURE_SECRET:-dev-secret}
+      CALLBACK_SIGNATURE_SECRET: ${CALLBACK_SIGNATURE_SECRET:-change-me-server-b-callback-secret}
       MINIO_FORECAST_BUCKET: ${MINIO_FORECAST_BUCKET:-ml-forecast}
       MINIO_OUTBREAK_BUCKET: ${MINIO_OUTBREAK_BUCKET:-ml-outbreak}
-      OUTBREAK_MODEL_PATH: ${OUTBREAK_MODEL_PATH:-model2/models/stgnn_model.pt}
+      OUTBREAK_MODEL_PATH: ${OUTBREAK_MODEL_PATH:-final_outbreak_model/models/stgnn_model.pt}
       GRAPH_RADIUS: ${GRAPH_RADIUS:-10}
       SEQUENCE_LENGTH: ${SEQUENCE_LENGTH:-7}
       BASE_DATA_DIR: ${BASE_DATA_DIR:-.}
-      OUTBREAK_BASE_DATA_DIR: ${OUTBREAK_BASE_DATA_DIR:-model2/data}
+      OUTBREAK_BASE_DATA_DIR: ${OUTBREAK_BASE_DATA_DIR:-final_outbreak_model/data}
 
 volumes:
   server_b_model_registry:

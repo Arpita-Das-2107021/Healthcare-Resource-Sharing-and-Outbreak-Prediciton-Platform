@@ -4,17 +4,23 @@ FROM node:20-alpine
 WORKDIR /app
 
 # Copy package files
-COPY package.json bun.lockb* ./
+COPY package.json package-lock.json bun.lockb* ./
 
-# Install dependencies
-RUN npm install
+# Install dependencies from lockfile for deterministic dev image builds
+RUN npm ci
 
 # Copy source code (will be overridden by volume mount)
 COPY . .
 
+# Install Docker entrypoint that keeps node_modules in sync with package files
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
 # Expose the development server port
 ENV CHOKIDAR_USEPOLLING=1
 EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
 # Start development server with hot reloading on 0.0.0.0:8080
 CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "8080"]
