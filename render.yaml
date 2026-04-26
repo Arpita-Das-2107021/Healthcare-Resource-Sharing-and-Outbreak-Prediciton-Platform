@@ -1,8 +1,7 @@
 services:
   - type: web
-    runtime: static
     name: hrsp-frontend-free
-    plan: free
+    # plan: free
     rootDir: frontend/frontend
     # No lockfile is currently present, so npm install is required instead of npm ci.
     buildCommand: npm install && npm run build
@@ -21,7 +20,7 @@ services:
   - type: web
     runtime: python
     name: hrsp-backend-free
-    plan: free
+    # plan: starter
     rootDir: backend
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT
@@ -41,7 +40,7 @@ services:
         value: https://hrsp-frontend-free.onrender.com/sharing/requests/outgoing
       - key: CORS_ALLOWED_ORIGINS
         value: https://hrsp-frontend-free.onrender.com
-      # Free tier setup: backend calls ML through ML's public Render URL.
+      # Public URL setup: backend calls ML through ML's Render URL.
       - key: ML_SERVER_B_BASE_URL
         value: https://hrsp-ml-server-free.onrender.com
       - key: DATABASE_URL
@@ -57,12 +56,12 @@ services:
       - key: ML_SERVER_B_HMAC_SECRET
         sync: false
 
-  # Free tier limitation: private services are unavailable, so ML must be a public web service.
-  # For production/hardened setup, switch this to pserv and point backend to an internal URL.
+  # ML is exposed as a public web service.
+  # For hardened setup, switch this to pserv and point backend to an internal URL.
   - type: web
     runtime: python
     name: hrsp-ml-server-free
-    plan: free
+    # plan: starter
     rootDir: "ML server"
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
